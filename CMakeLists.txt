@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
 
-# Set extension name here
 set(TARGET_NAME waddle)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
@@ -13,7 +12,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/waddle_extension.cpp)
+set(EXTENSION_SOURCES
+    src/waddle_extension.cpp
+    src/query_recycler_cache.cpp
+    src/query_recycler_operator.cpp
+    src/query_recycler_optimizer.cpp
+)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
