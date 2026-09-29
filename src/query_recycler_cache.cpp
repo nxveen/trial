@@ -1,46 +1,68 @@
 #include "query_recycler_cache.hpp"
 
-#include "duckdb/common/types/column/column_data_collection.hpp"
-
 namespace duckdb {
 
-shared_ptr<RecyclingCacheEntry> RecyclingCache::GetOrCreate(ClientContext &context, const string &key,
-                                                            const vector<LogicalType> &types) {
+shared_ptr<RecyclingCacheEntry> RecyclingCache::FindReady(const string &fingerprint) {
 	lock_guard<mutex> guard(lock);
 
-	auto entry = entries.find(key);
-	if (entry != entries.end()) {
-		return entry->second;
+	auto it = entries.find(fingerprint);
+	if (it == entries.end()) {
+		return nullptr;
+	}
+
+	auto entry = it->second;
+
+	if (!entry->ready || entry->building) {
+		return nullptr;
+	}
+
+	entry->hits++;
+	entry->last_used = ++clock;
+
+	return entry;
+}
+
+shared_ptr<RecyclingCacheEntry> RecyclingCache::BeginBuild(ClientContext &context,
+                                                            const string &fingerprint,
+                                                            const vector<LogicalType> &types,
+                                                            const vector<ColumnBinding> &bindings) {
+	lock_guard<mutex> guard(lock);
+
+	auto existing = entries.find(fingerprint);
+
+	if (existing != entries.end()) {
+		// Somebody else is currently building this exact subplan.
+		if (existing->second->building) {
+			return nullptr;
+		}
+
+		// A completed entry should have been returned by FindReady().
+		if (existing->second->ready) {
+			return nullptr;
+		}
+
+		// Remove a stale failed entry.
+		if (existing->second->collection) {
+			if (total_bytes >= existing->second->bytes) {
+				total_bytes -= existing->second->bytes;
+			}
+		}
+
+		entries.erase(existing);
 	}
 
 	auto collection = make_shared_ptr<ColumnDataCollection>(context, types);
 
-	auto result = make_shared_ptr<RecyclingCacheEntry>(key, collection);
-	entries.emplace(key, result);
+	auto entry = make_shared_ptr<RecyclingCacheEntry>(
+	    fingerprint, types, bindings, std::move(collection));
 
-	return result;
-}
-
-bool RecyclingCache::IsReady(const shared_ptr<RecyclingCacheEntry> &entry) {
-	lock_guard<mutex> guard(lock);
-	return entry && entry->ready;
-}
-
-void RecyclingCache::BeginMaterialization(const shared_ptr<RecyclingCacheEntry> &entry) {
-	if (!entry) {
-		return;
-	}
-
-	lock_guard<mutex> guard(lock);
-
-	// The entry is expected to be incomplete here.
+	entry->building = true;
 	entry->ready = false;
+	entry->last_used = ++clock;
 
-	if (entry->collection) {
-		entry->collection->Reset();
-	}
+	entries.emplace(fingerprint, entry);
 
-	entry->bytes = 0;
+	return entry;
 }
 
 void RecyclingCache::MarkReady(const shared_ptr<RecyclingCacheEntry> &entry) {
@@ -51,22 +73,26 @@ void RecyclingCache::MarkReady(const shared_ptr<RecyclingCacheEntry> &entry) {
 	lock_guard<mutex> guard(lock);
 
 	if (!entry->collection) {
+		entry->building = false;
 		entry->ready = false;
 		return;
 	}
 
 	entry->bytes = entry->collection->SizeInBytes();
-	entry->ready = true;
 
-	// Recalculate defensively.
+	entry->building = false;
+	entry->ready = true;
+	entry->last_used = ++clock;
+
 	total_bytes = 0;
+
 	for (auto &kv : entries) {
 		if (kv.second->ready) {
 			total_bytes += kv.second->bytes;
 		}
 	}
 
-	EvictIfNeeded(entry);
+	EvictIfNeeded();
 }
 
 void RecyclingCache::MarkFailed(const shared_ptr<RecyclingCacheEntry> &entry) {
@@ -76,14 +102,24 @@ void RecyclingCache::MarkFailed(const shared_ptr<RecyclingCacheEntry> &entry) {
 
 	lock_guard<mutex> guard(lock);
 
-	entry->ready = false;
-	entry->bytes = 0;
+	auto it = entries.find(entry->fingerprint);
 
-	if (entry->collection) {
-		entry->collection->Reset();
+	if (it == entries.end()) {
+		return;
 	}
 
+	if (it->second != entry) {
+		return;
+	}
+
+	if (entry->ready) {
+		return;
+	}
+
+	entries.erase(it);
+
 	total_bytes = 0;
+
 	for (auto &kv : entries) {
 		if (kv.second->ready) {
 			total_bytes += kv.second->bytes;
@@ -91,21 +127,30 @@ void RecyclingCache::MarkFailed(const shared_ptr<RecyclingCacheEntry> &entry) {
 	}
 }
 
-void RecyclingCache::EvictIfNeeded(const shared_ptr<RecyclingCacheEntry> &keep) {
-	while ((entries.size() > MAX_ENTRIES || total_bytes > MAX_BYTES) && entries.size() > 1) {
+void RecyclingCache::Touch(const shared_ptr<RecyclingCacheEntry> &entry) {
+	if (!entry) {
+		return;
+	}
+
+	lock_guard<mutex> guard(lock);
+
+	entry->last_used = ++clock;
+}
+
+void RecyclingCache::EvictIfNeeded() {
+	while ((entries.size() > MAX_ENTRIES || total_bytes > MAX_BYTES) && !entries.empty()) {
 		auto victim = entries.end();
 
 		for (auto it = entries.begin(); it != entries.end(); ++it) {
-			if (it->second == keep) {
+			auto &entry = it->second;
+
+			// Never evict an entry while it is being materialized.
+			if (entry->building) {
 				continue;
 			}
 
-			if (!it->second->ready) {
-				victim = it;
-				break;
-			}
-
-			if (victim == entries.end()) {
+			if (victim == entries.end() ||
+			    entry->last_used < victim->second->last_used) {
 				victim = it;
 			}
 		}
@@ -123,15 +168,6 @@ void RecyclingCache::EvictIfNeeded(const shared_ptr<RecyclingCacheEntry> &keep) 
 		}
 
 		entries.erase(victim);
-	}
-
-	// A single query result larger than MAX_BYTES is still retained. This is
-	// preferable to immediately throwing away the result we just computed.
-	total_bytes = 0;
-	for (auto &kv : entries) {
-		if (kv.second->ready) {
-			total_bytes += kv.second->bytes;
-		}
 	}
 }
 

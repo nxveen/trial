@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 
@@ -10,59 +11,112 @@ namespace duckdb {
 
 class PhysicalPlanGenerator;
 
-//! Logical wrapper inserted around a query on a cache miss.
-class LogicalQueryRecycler : public LogicalExtensionOperator {
+// -------------------------------------------------------------------------
+// LogicalRecyclerMaterialize
+// -------------------------------------------------------------------------
+
+class LogicalRecyclerMaterialize : public LogicalExtensionOperator {
 public:
-	static constexpr const LogicalOperatorType TYPE = LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR;
+	LogicalRecyclerMaterialize(
+	    unique_ptr<LogicalOperator> child,
+	    shared_ptr<RecyclingCache> cache_p,
+	    shared_ptr<RecyclingCacheEntry> entry_p);
 
-	LogicalQueryRecycler(unique_ptr<LogicalOperator> child, shared_ptr<RecyclingCache> cache,
-	                     shared_ptr<RecyclingCacheEntry> entry, idx_t table_index);
+	void ResolveTypes() override;
 
-	shared_ptr<RecyclingCache> cache;
-	shared_ptr<RecyclingCacheEntry> entry;
-	idx_t table_index;
-
-	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
-
-	string GetExtensionName() const override {
-		return "waddle_query_recycler";
-	}
-
-	bool SupportSerialization() const override {
-		return false;
-	}
+	void ResolveColumnBindings(
+	    ColumnBindingResolver &res,
+	    vector<ColumnBinding> &bindings) override;
 
 	vector<ColumnBinding> GetColumnBindings() override;
 
-protected:
-	void ResolveTypes() override;
+	PhysicalOperator &CreatePlan(
+	    ClientContext &context,
+	    PhysicalPlanGenerator &planner) override;
+
+private:
+	vector<ColumnBinding> bindings;
+
+	shared_ptr<RecyclingCache> cache;
+	shared_ptr<RecyclingCacheEntry> entry;
 };
 
-//! Physical operator that materializes the child into a ColumnDataCollection
-//! and then exposes the collection as a source.
-class PhysicalQueryRecycler : public PhysicalOperator {
+// -------------------------------------------------------------------------
+// LogicalRecyclerScan
+// -------------------------------------------------------------------------
+//
+// On a cache hit, the physical data comes from the cached collection.
+//
+// IMPORTANT:
+// The ColumnBindings belong to the CURRENT query. They must not be copied
+// from RecyclingCacheEntry because that entry may have been created by a
+// previous query compilation.
+// -------------------------------------------------------------------------
+
+class LogicalRecyclerScan : public LogicalExtensionOperator {
 public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
+	LogicalRecyclerScan(
+	    shared_ptr<RecyclingCacheEntry> entry_p,
+	    vector<ColumnBinding> current_bindings);
 
-	PhysicalQueryRecycler(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                      PhysicalOperator &child, shared_ptr<RecyclingCache> cache,
-	                      shared_ptr<RecyclingCacheEntry> entry);
+	void ResolveTypes() override;
 
-	~PhysicalQueryRecycler() override;
+	void ResolveColumnBindings(
+	    ColumnBindingResolver &res,
+	    vector<ColumnBinding> &bindings) override;
 
-	// Sink side.
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
+	vector<ColumnBinding> GetColumnBindings() override;
 
-	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+	PhysicalOperator &CreatePlan(
+	    ClientContext &context,
+	    PhysicalPlanGenerator &planner) override;
 
-	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk,
-	                    OperatorSinkInput &input) const override;
+private:
+	vector<ColumnBinding> bindings;
 
-	SinkCombineResultType Combine(ExecutionContext &context,
-	                              OperatorSinkCombineInput &input) const override;
+	shared_ptr<RecyclingCacheEntry> entry;
+};
 
-	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	                          OperatorSinkFinalizeInput &input) const override;
+// -------------------------------------------------------------------------
+// PhysicalRecyclerMaterialize
+// -------------------------------------------------------------------------
+
+class PhysicalRecyclerMaterialize : public PhysicalOperator {
+public:
+	static constexpr const PhysicalOperatorType TYPE =
+	    PhysicalOperatorType::EXTENSION;
+
+	PhysicalRecyclerMaterialize(
+	    PhysicalPlan &physical_plan,
+	    vector<LogicalType> types,
+	    idx_t estimated_cardinality,
+	    PhysicalOperator &child,
+	    shared_ptr<RecyclingCache> cache,
+	    shared_ptr<RecyclingCacheEntry> entry);
+
+	~PhysicalRecyclerMaterialize() override;
+
+	// Sink.
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(
+	    ClientContext &context) const override;
+
+	unique_ptr<LocalSinkState> GetLocalSinkState(
+	    ExecutionContext &context) const override;
+
+	SinkResultType Sink(
+	    ExecutionContext &context,
+	    DataChunk &chunk,
+	    OperatorSinkInput &input) const override;
+
+	SinkCombineResultType Combine(
+	    ExecutionContext &context,
+	    OperatorSinkCombineInput &input) const override;
+
+	SinkFinalizeType Finalize(
+	    Pipeline &pipeline,
+	    Event &event,
+	    ClientContext &context,
+	    OperatorSinkFinalizeInput &input) const override;
 
 	bool IsSink() const override {
 		return true;
@@ -72,14 +126,18 @@ public:
 		return false;
 	}
 
-	// Source side.
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	// Source.
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(
+	    ClientContext &context) const override;
 
-	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	                                                 GlobalSourceState &gstate) const override;
+	unique_ptr<LocalSourceState> GetLocalSourceState(
+	    ExecutionContext &context,
+	    GlobalSourceState &gstate) const override;
 
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                 OperatorSourceInput &input) const override;
+	SourceResultType GetDataInternal(
+	    ExecutionContext &context,
+	    DataChunk &chunk,
+	    OperatorSourceInput &input) const override;
 
 	bool IsSource() const override {
 		return true;
@@ -96,6 +154,47 @@ private:
 	shared_ptr<RecyclingCacheEntry> entry;
 
 	mutable bool finalized = false;
+};
+
+// -------------------------------------------------------------------------
+// PhysicalRecyclerScan
+// -------------------------------------------------------------------------
+
+class PhysicalRecyclerScan : public PhysicalOperator {
+public:
+	static constexpr const PhysicalOperatorType TYPE =
+	    PhysicalOperatorType::EXTENSION;
+
+	PhysicalRecyclerScan(
+	    PhysicalPlan &physical_plan,
+	    vector<LogicalType> types,
+	    idx_t estimated_cardinality,
+	    shared_ptr<RecyclingCacheEntry> entry);
+
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(
+	    ClientContext &context) const override;
+
+	unique_ptr<LocalSourceState> GetLocalSourceState(
+	    ExecutionContext &context,
+	    GlobalSourceState &gstate) const override;
+
+	SourceResultType GetDataInternal(
+	    ExecutionContext &context,
+	    DataChunk &chunk,
+	    OperatorSourceInput &input) const override;
+
+	bool IsSource() const override {
+		return true;
+	}
+
+	bool ParallelSource() const override {
+		return false;
+	}
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override;
+
+private:
+	shared_ptr<RecyclingCacheEntry> entry;
 };
 
 } // namespace duckdb

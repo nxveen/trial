@@ -3,43 +3,53 @@
 #include "waddle_extension.hpp"
 
 #include "duckdb.hpp"
-#include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
-
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
 #include "query_recycler_cache.hpp"
 #include "query_recycler_optimizer.hpp"
 
 namespace duckdb {
 
-inline void WaddleScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+inline void WaddleScalarFun(
+    DataChunk &args,
+    ExpressionState &state,
+    Vector &result) {
+
 	auto &name_vector = args.data[0];
 
 	UnaryExecutor::Execute<string_t, string_t>(
-	    name_vector, result, args.size(), [&](string_t name) {
-		    return StringVector::AddString(result, "...........🦆 " + name.GetString());
+	    name_vector,
+	    result,
+	    args.size(),
+	    [&](string_t name) {
+		    return StringVector::AddString(
+		        result,
+		        "...........🦆 " + name.GetString());
 	    });
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// Keep the original template function so the extension still behaves
-	// like a normal DuckDB extension outside the benchmark.
+
 	auto waddle_scalar_function =
-	    ScalarFunction("waddle", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WaddleScalarFun);
+	    ScalarFunction(
+	        "waddle",
+	        {LogicalType::VARCHAR},
+	        LogicalType::VARCHAR,
+	        WaddleScalarFun);
 
 	loader.RegisterFunction(waddle_scalar_function);
 
-	// ------------------------------------------------------------
-	// Query recycling
-	// ------------------------------------------------------------
+	// One recycler cache per DuckDB database instance.
+	auto cache =
+	    make_shared_ptr<RecyclingCache>();
 
-	auto cache = make_shared_ptr<RecyclingCache>();
+	auto optimizer =
+	    CreateQueryRecyclerOptimizer(cache);
 
-	auto optimizer = CreateQueryRecyclerOptimizer(cache);
-
-	OptimizerExtension::Register(loader.GetDatabaseInstance().config, std::move(optimizer));
+	OptimizerExtension::Register(
+	    loader.GetDatabaseInstance().config,
+	    std::move(optimizer));
 }
 
 void WaddleExtension::Load(ExtensionLoader &loader) {

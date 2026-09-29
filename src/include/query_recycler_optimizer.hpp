@@ -7,13 +7,14 @@
 namespace duckdb {
 
 struct QueryRecyclerOptimizerInfo : public OptimizerExtensionInfo {
-	explicit QueryRecyclerOptimizerInfo(shared_ptr<RecyclingCache> cache_p) : cache(std::move(cache_p)) {
+	explicit QueryRecyclerOptimizerInfo(shared_ptr<RecyclingCache> cache_p)
+	    : cache(std::move(cache_p)) {
 	}
 
 	shared_ptr<RecyclingCache> cache;
 };
 
-// Register the optimizer with DuckDB.
-OptimizerExtension CreateQueryRecyclerOptimizer(shared_ptr<RecyclingCache> cache);
+OptimizerExtension CreateQueryRecyclerOptimizer(
+    shared_ptr<RecyclingCache> cache);
 
 } // namespace duckdb
