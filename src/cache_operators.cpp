@@ -1,24 +1,77 @@
 #include "cache_operators.hpp"
 
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
-// Capture
+// Scanning a collection, shared by the operators below
 //===--------------------------------------------------------------------===//
 
-//! Per-thread state of the capture operator. The operator is not parallel, so
-//! there is exactly one of these per query.
-class CaptureState : public OperatorState {
+class CollectionScanGlobalState : public GlobalSourceState {
 public:
-	unique_ptr<ColumnDataCollection> data;
+	CollectionScanGlobalState(shared_ptr<ColumnDataCollection> collection_p, bool ordered)
+	    : collection(std::move(collection_p)),
+	      max_threads(ordered ? 1 : MaxValue<idx_t>(collection->ChunkCount(), 1)) {
+		collection->InitializeScan(scan_state);
+	}
+
+	idx_t MaxThreads() override {
+		return max_threads;
+	}
+
+	//! Held here so the rows outlive anything else that lets go of them.
+	shared_ptr<ColumnDataCollection> collection;
+	ColumnDataParallelScanState scan_state;
+	const idx_t max_threads;
+};
+
+class CollectionScanLocalState : public LocalSourceState {
+public:
+	ColumnDataLocalScanState scan_state;
+};
+
+static SourceResultType ScanCollection(DataChunk &chunk, OperatorSourceInput &input) {
+	auto &gstate = input.global_state.Cast<CollectionScanGlobalState>();
+	auto &lstate = input.local_state.Cast<CollectionScanLocalState>();
+	gstate.collection->Scan(gstate.scan_state, lstate.scan_state, chunk);
+	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+}
+
+//! Hands a complete result to the recycler, which admits it or not.
+static void Publish(Recycler &recycler, const StoreDecision &decision, const vector<LogicalType> &types,
+                    shared_ptr<ColumnDataCollection> data, bool ordered) {
+	auto result = make_shared_ptr<CachedResult>();
+	result->types = types;
+	result->bytes = data->SizeInBytes();
+	result->data = std::move(data);
+	result->ordered = ordered;
+	recycler.Store(decision.fingerprint, std::move(result), decision.estimated_bcost, decision.speculative,
+	               decision.force, decision.now);
+}
+
+//===--------------------------------------------------------------------===//
+// Materializing store operator
+//===--------------------------------------------------------------------===//
+
+class CaptureGlobalSinkState : public GlobalSinkState {
+public:
+	mutex lock;
+	//! Everything the subtree produced, buffer-managed so it respects
+	//! memory_limit and can spill while the query runs.
+	unique_ptr<ColumnDataCollection> collected;
+	//! What the source half emits, set in Finalize.
+	shared_ptr<ColumnDataCollection> output;
+};
+
+class CaptureLocalSinkState : public LocalSinkState {
+public:
+	unique_ptr<ColumnDataCollection> collected;
 	ColumnDataAppendState append_state;
-	//! Set when the result outgrew the budget: we stop copying and give up on
-	//! caching this plan, but the query itself runs on untouched.
-	bool gave_up = false;
 };
 
 class PhysicalCaptureResult : public PhysicalOperator {
@@ -26,80 +79,238 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
 	PhysicalCaptureResult(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                      shared_ptr<ResultCache> cache, hash_t fingerprint, string plan_key, idx_t max_bytes)
-	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality), cache(std::move(cache)),
-	      fingerprint(fingerprint), plan_key(std::move(plan_key)), max_bytes(max_bytes) {
+	                      shared_ptr<Recycler> recycler, StoreDecision decision, bool ordered)
+	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality),
+	      recycler(std::move(recycler)), decision(decision), ordered(ordered) {
 	}
 
-	shared_ptr<ResultCache> cache;
-	hash_t fingerprint;
-	string plan_key;
-	idx_t max_bytes;
+	shared_ptr<Recycler> recycler;
+	StoreDecision decision;
+	bool ordered;
 
 	string GetName() const override {
-		return "CAPTURE_RESULT";
+		return "STORE";
 	}
 
-	// ParallelOperator() stays false (the default): one thread runs this
-	// operator, so rows are appended in a single, reproducible order. The price
-	// is that the pipeline this operator sits in is not parallelised.
+	bool IsSink() const override {
+		return true;
+	}
+	bool ParallelSink() const override {
+		// One thread keeps rows in the order the subtree produced them.
+		return !ordered;
+	}
+	bool SinkOrderDependent() const override {
+		return ordered;
+	}
+
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		auto state = make_uniq<CaptureGlobalSinkState>();
+		state->collected = make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context), types);
+		return std::move(state);
+	}
+
+	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
+		auto state = make_uniq<CaptureLocalSinkState>();
+		state->collected = make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context.client), types);
+		state->collected->InitializeAppend(state->append_state);
+		return std::move(state);
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &lstate = input.local_state.Cast<CaptureLocalSinkState>();
+		lstate.collected->Append(lstate.append_state, chunk);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
+	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override {
+		auto &gstate = input.global_state.Cast<CaptureGlobalSinkState>();
+		auto &lstate = input.local_state.Cast<CaptureLocalSinkState>();
+		lock_guard<mutex> guard(gstate.lock);
+		gstate.collected->Combine(*lstate.collected);
+		return SinkCombineResultType::FINISHED;
+	}
+
+	//! Runs once, after every pipeline feeding this operator has finished.
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override {
+		auto &gstate = input.global_state.Cast<CaptureGlobalSinkState>();
+		if (gstate.collected->SizeInBytes() > decision.max_bytes || gstate.collected->Count() > decision.max_rows) {
+			// Too big to be worth keeping: just pass the rows on.
+			recycler->MarkOversized(decision.fingerprint);
+			gstate.output = std::move(gstate.collected);
+			return SinkFinalizeType::READY;
+		}
+		// The cached copy must not live in the buffer manager: cached results
+		// outlive the query that made them, and DuckDB tears the buffer manager
+		// down before extension state.
+		auto copy = make_shared_ptr<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
+		ColumnDataAppendState append_state;
+		copy->InitializeAppend(append_state);
+		ColumnDataScanState scan_state;
+		gstate.collected->InitializeScan(scan_state);
+		DataChunk chunk;
+		gstate.collected->InitializeScanChunk(scan_state, chunk);
+		while (gstate.collected->Scan(scan_state, chunk)) {
+			copy->Append(append_state, chunk);
+		}
+		gstate.collected.reset();
+		Publish(*recycler, decision, types, copy, ordered);
+		gstate.output = std::move(copy);
+		return SinkFinalizeType::READY;
+	}
+
+	bool IsSource() const override {
+		return true;
+	}
+	bool ParallelSource() const override {
+		return !ordered;
+	}
+
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		auto &gstate = sink_state->Cast<CaptureGlobalSinkState>();
+		return make_uniq<CollectionScanGlobalState>(gstate.output, ordered);
+	}
+
+	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+	                                                 GlobalSourceState &gstate) const override {
+		return make_uniq<CollectionScanLocalState>();
+	}
+
+protected:
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override {
+		return ScanCollection(chunk, input);
+	}
+};
+
+//===--------------------------------------------------------------------===//
+// Streaming store operator
+//===--------------------------------------------------------------------===//
+
+class StreamingCaptureGlobalState : public GlobalOperatorState {
+public:
+	mutex lock;
+	//! In-memory (not buffer-managed) from the start, so publishing needs no copy.
+	unique_ptr<ColumnDataCollection> collected;
+	//! Set once the rows outgrow what the cache would take: stop copying (the
+	//! paper's "cancels buffering and reverts to passing its input along").
+	atomic<bool> gave_up {false};
+	//! Thread states handed out, and thread states whose rows were merged.
+	//! Publishing requires the two to match: a thread whose share never
+	//! reached FinalExecute (an operator below ended the pipeline on the last
+	//! chunk of a task, say) would otherwise leave a hole in the result.
+	atomic<idx_t> started {0};
+	atomic<idx_t> merged {0};
+};
+
+class StreamingCaptureLocalState : public OperatorState {
+public:
+	unique_ptr<ColumnDataCollection> collected;
+	ColumnDataAppendState append_state;
+};
+
+class PhysicalStreamingCapture : public PhysicalOperator {
+public:
+	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
+
+	PhysicalStreamingCapture(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                         shared_ptr<Recycler> recycler, StoreDecision decision, bool ordered)
+	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality),
+	      recycler(std::move(recycler)), decision(decision), ordered(ordered) {
+	}
+
+	shared_ptr<Recycler> recycler;
+	StoreDecision decision;
+	bool ordered;
+
+	string GetName() const override {
+		return "STORE_STREAMING";
+	}
+
+	bool ParallelOperator() const override {
+		return !ordered;
+	}
+	bool RequiresFinalExecute() const override {
+		return true;
+	}
+	bool RequiresOperatorFinalize() const override {
+		return true;
+	}
+
+	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override {
+		auto state = make_uniq<StreamingCaptureGlobalState>();
+		state->collected = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
+		return std::move(state);
+	}
+
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override {
-		auto state = make_uniq<CaptureState>();
-		// Deliberately NOT the buffer manager: cached results outlive the query
-		// that made them, and DuckDB tears the buffer manager down before
-		// extension state, which would leave the cache pointing at freed
-		// blocks. The cost is that these bytes sit outside memory_limit, which
-		// is why the cache keeps its own budget.
-		state->data = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
-		state->data->InitializeAppend(state->append_state);
+		if (op_state) {
+			op_state->Cast<StreamingCaptureGlobalState>().started++;
+		}
+		auto state = make_uniq<StreamingCaptureLocalState>();
+		state->collected = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
+		state->collected->InitializeAppend(state->append_state);
 		return std::move(state);
 	}
 
 	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-	                           GlobalOperatorState &gstate, OperatorState &state_p) const override {
-		auto &state = state_p.Cast<CaptureState>();
-		if (!state.gave_up) {
-			state.data->Append(state.append_state, input);
-			if (state.data->AllocationSize() > max_bytes) {
-				state.gave_up = true;
-				state.data.reset();
+	                           GlobalOperatorState &gstate_p, OperatorState &state_p) const override {
+		auto &gstate = gstate_p.Cast<StreamingCaptureGlobalState>();
+		auto &lstate = state_p.Cast<StreamingCaptureLocalState>();
+		if (lstate.collected && !gstate.gave_up) {
+			lstate.collected->Append(lstate.append_state, input);
+			if (lstate.collected->SizeInBytes() > decision.max_bytes ||
+			    lstate.collected->Count() > decision.max_rows) {
+				gstate.gave_up = true;
 			}
 		}
-		// The rows still flow onwards, untouched.
+		if (gstate.gave_up && lstate.collected) {
+			lstate.collected.reset();
+		}
 		chunk.Reference(input);
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	bool RequiresFinalExecute() const override {
-		return true;
+	//! Runs once per thread, when its share of the pipeline is done.
+	OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk, GlobalOperatorState &gstate_p,
+	                                        OperatorState &state_p) const override {
+		auto &gstate = gstate_p.Cast<StreamingCaptureGlobalState>();
+		auto &lstate = state_p.Cast<StreamingCaptureLocalState>();
+		if (lstate.collected && !gstate.gave_up) {
+			lock_guard<mutex> guard(gstate.lock);
+			gstate.collected->Combine(*lstate.collected);
+		}
+		if (lstate.collected) {
+			gstate.merged++;
+		}
+		lstate.collected.reset();
+		return OperatorFinalizeResultType::FINISHED;
 	}
 
-	//! Called once, after the last row has passed through. Reaching this point
-	//! means the plan below ran to completion, so the copy is a complete result.
-	//! Called once, after the last row has passed through. Reaching this point
-	//! means the plan below ran to completion, so the copy is a complete
-	//! result.
-	OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk, GlobalOperatorState &gstate,
-	                                        OperatorState &state_p) const override {
-		auto &state = state_p.Cast<CaptureState>();
-		// An empty copy is never published. DuckDB sometimes runs the same
-		// operator a second time within one query, and that run can see no
-		// rows at all; publishing it would replace a complete result with
-		// nothing. A subtree that genuinely returns no rows is cheap to
-		// recompute, so skipping those costs nothing. The cache also keeps the
-		// first result stored under a key, so a later run cannot overwrite it.
-		if (!state.gave_up && state.data && state.data->Count() > 0) {
-			shared_ptr<ColumnDataCollection> data = std::move(state.data);
-			cache->Insert(fingerprint, plan_key, types, std::move(data));
+	//! Runs once, after every thread of the pipeline has finished.
+	OperatorFinalResultType OperatorFinalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                                         OperatorFinalizeInput &input) const override {
+		auto &gstate = input.global_state.Cast<StreamingCaptureGlobalState>();
+		if (gstate.gave_up || gstate.collected->SizeInBytes() > decision.max_bytes ||
+		    gstate.collected->Count() > decision.max_rows) {
+			recycler->MarkOversized(decision.fingerprint);
+			gstate.collected.reset();
+			return OperatorFinalResultType::FINISHED;
 		}
-		chunk.SetCardinality(0);
-		return OperatorFinalizeResultType::FINISHED;
+		if (gstate.started == 0 || gstate.merged != gstate.started) {
+			// Some thread's rows are missing: keep nothing rather than half.
+			gstate.collected.reset();
+			return OperatorFinalResultType::FINISHED;
+		}
+		shared_ptr<ColumnDataCollection> data = std::move(gstate.collected);
+		Publish(*recycler, decision, types, std::move(data), ordered);
+		return OperatorFinalResultType::FINISHED;
 	}
 };
 
-LogicalCaptureResult::LogicalCaptureResult(shared_ptr<ResultCache> cache_p, hash_t fingerprint_p, string plan_key_p,
-                                           idx_t max_bytes_p)
-    : cache(std::move(cache_p)), fingerprint(fingerprint_p), plan_key(std::move(plan_key_p)), max_bytes(max_bytes_p) {
+LogicalCaptureResult::LogicalCaptureResult(shared_ptr<Recycler> recycler_p, StoreDecision decision_p, bool ordered_p,
+                                           CaptureMode mode_p)
+    : recycler(std::move(recycler_p)), decision(decision_p), ordered(ordered_p), mode(mode_p) {
 }
 
 void LogicalCaptureResult::ResolveTypes() {
@@ -107,13 +318,12 @@ void LogicalCaptureResult::ResolveTypes() {
 }
 
 vector<ColumnBinding> LogicalCaptureResult::GetColumnBindings() {
-	// Pass-through: the rows above see exactly the columns the child produced,
-	// so nothing above this operator needs rewriting.
+	// Pass-through: nothing above this operator needs rewriting.
 	return children[0]->GetColumnBindings();
 }
 
 string LogicalCaptureResult::GetName() const {
-	return "CAPTURE_RESULT";
+	return "STORE";
 }
 
 string LogicalCaptureResult::GetExtensionName() const {
@@ -122,8 +332,13 @@ string LogicalCaptureResult::GetExtensionName() const {
 
 PhysicalOperator &LogicalCaptureResult::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	auto &child = planner.CreatePlan(*children[0]);
-	auto &op =
-	    planner.Make<PhysicalCaptureResult>(types, estimated_cardinality, cache, fingerprint, plan_key, max_bytes);
+	if (mode == CaptureMode::MATERIALIZING) {
+		auto &op = planner.Make<PhysicalCaptureResult>(types, estimated_cardinality, recycler, decision, ordered);
+		op.children.push_back(child);
+		return op;
+	}
+	auto &op = planner.Make<PhysicalStreamingCapture>(types, estimated_cardinality, recycler, decision,
+	                                                  mode == CaptureMode::STREAMING_ORDERED);
 	op.children.push_back(child);
 	return op;
 }
@@ -132,23 +347,20 @@ PhysicalOperator &LogicalCaptureResult::CreatePlan(ClientContext &context, Physi
 // Cached scan
 //===--------------------------------------------------------------------===//
 
-class CachedScanState : public GlobalSourceState {
-public:
-	ColumnDataScanState scan_state;
-};
-
 class PhysicalCachedScan : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
 	PhysicalCachedScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                   shared_ptr<CachedResult> result)
-	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality), result(std::move(result)) {
+	                   shared_ptr<CachedResult> result, bool ordered)
+	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality), result(std::move(result)),
+	      ordered(ordered) {
 	}
 
 	//! Holding the shared_ptr keeps the rows alive for as long as this plan
-	//! exists, even if the cache evicts the entry mid-query.
+	//! exists, even if the recycler evicts the result mid-query.
 	shared_ptr<CachedResult> result;
+	bool ordered;
 
 	string GetName() const override {
 		return "CACHED_SCAN";
@@ -157,26 +369,28 @@ public:
 	bool IsSource() const override {
 		return true;
 	}
-
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
-		auto state = make_uniq<CachedScanState>();
-		result->data->InitializeScan(state->scan_state);
-		return std::move(state);
+	bool ParallelSource() const override {
+		return !ordered;
 	}
 
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		return make_uniq<CollectionScanGlobalState>(result->data, ordered);
+	}
+
+	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+	                                                 GlobalSourceState &gstate) const override {
+		return make_uniq<CollectionScanLocalState>();
+	}
+
+protected:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override {
-		auto &state = input.global_state.Cast<CachedScanState>();
-		// Rows come back in the order they were produced the first time.
-		if (!result->data->Scan(state.scan_state, chunk)) {
-			return SourceResultType::FINISHED;
-		}
-		return SourceResultType::HAVE_MORE_OUTPUT;
+		return ScanCollection(chunk, input);
 	}
 };
 
-LogicalCachedScan::LogicalCachedScan(shared_ptr<CachedResult> result_p, idx_t table_index_p)
-    : result(std::move(result_p)), table_index(table_index_p) {
+LogicalCachedScan::LogicalCachedScan(shared_ptr<CachedResult> result_p, idx_t table_index_p, bool ordered_p)
+    : result(std::move(result_p)), table_index(table_index_p), ordered(ordered_p) {
 	types = result->types;
 	SetEstimatedCardinality(result->data->Count());
 }
@@ -202,7 +416,7 @@ string LogicalCachedScan::GetExtensionName() const {
 }
 
 PhysicalOperator &LogicalCachedScan::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
-	return planner.Make<PhysicalCachedScan>(types, estimated_cardinality, result);
+	return planner.Make<PhysicalCachedScan>(types, estimated_cardinality, result, ordered);
 }
 
 } // namespace duckdb

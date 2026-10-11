@@ -17,7 +17,8 @@ set(EXTENSION_SOURCES
     src/waddle_extension.cpp
     src/plan_key.cpp
     src/plan_rewrite.cpp
-    src/result_cache.cpp
+    src/cost_model.cpp
+    src/recycler.cpp
     src/cache_operators.cpp
     src/recycler_optimizer.cpp)
 
