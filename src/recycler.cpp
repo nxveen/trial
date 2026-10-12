@@ -76,6 +76,29 @@ shared_ptr<CachedResult> Recycler::Peek(hash_t fingerprint, const string &key) {
 	return node && node->key == key ? node->cached : nullptr;
 }
 
+void Recycler::SetAlias(hash_t fingerprint, const string &key, hash_t root) {
+	lock_guard<mutex> guard(lock);
+	auto &alias = aliases[fingerprint];
+	if (alias.key.empty() || alias.key == key) {
+		alias.key = key;
+		alias.root = root;
+	}
+}
+
+shared_ptr<CachedResult> Recycler::LookupAlias(hash_t fingerprint, const string &key, hash_t &root) {
+	lock_guard<mutex> guard(lock);
+	auto alias = aliases.find(fingerprint);
+	if (alias == aliases.end() || alias->second.key != key) {
+		return nullptr;
+	}
+	auto node = Find(alias->second.root);
+	if (!node) {
+		return nullptr;
+	}
+	root = alias->second.root;
+	return node->cached;
+}
+
 void Recycler::Reference(hash_t fingerprint, idx_t now) {
 	lock_guard<mutex> guard(lock);
 	auto node = Find(fingerprint);
@@ -306,6 +329,7 @@ void Recycler::Invalidate() {
 void Recycler::Reset() {
 	lock_guard<mutex> guard(lock);
 	graph.clear();
+	aliases.clear();
 	bytes_used = 0;
 	latest = 0;
 	stats = RecyclerStats();
@@ -328,3 +352,4 @@ RecyclerStats Recycler::GetStats() {
 }
 
 } // namespace duckdb
+

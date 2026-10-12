@@ -119,6 +119,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Also store new joins speculatively when their estimated cost reaches this many "
 	                          "microseconds (0: only final results and aggregations, as in the paper's examples)",
 	                          LogicalType::DOUBLE, Value::DOUBLE(2000.0));
+	config.AddExtensionOption("waddle_recycle_below_delim",
+	                          "Also recycle subtrees below delim joins (decorrelated EXISTS / correlated subqueries)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("waddle_log", "Print what the recycler does with each query", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false));
 
@@ -155,3 +158,4 @@ DUCKDB_CPP_EXTENSION_ENTRY(waddle, loader) {
 	duckdb::LoadInternal(loader);
 }
 }
+

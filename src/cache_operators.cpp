@@ -259,8 +259,12 @@ public:
 		auto &lstate = state_p.Cast<StreamingCaptureLocalState>();
 		if (lstate.collected && !gstate.gave_up) {
 			lstate.collected->Append(lstate.append_state, input);
-			if (lstate.collected->SizeInBytes() > decision.max_bytes ||
-			    lstate.collected->Count() > decision.max_rows) {
+			// AllocationSize is a running total and an upper bound of the data
+			// size; SizeInBytes walks every block. So the exact size is only
+			// computed once the cheap bound says the limit may be exceeded.
+			auto &collected = *lstate.collected;
+			if (collected.Count() > decision.max_rows ||
+			    (collected.AllocationSize() > decision.max_bytes && collected.SizeInBytes() > decision.max_bytes)) {
 				gstate.gave_up = true;
 			}
 		}
@@ -420,3 +424,4 @@ PhysicalOperator &LogicalCachedScan::CreatePlan(ClientContext &context, Physical
 }
 
 } // namespace duckdb
+

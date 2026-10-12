@@ -99,6 +99,15 @@ public:
 	//! that are only explained, never run).
 	shared_ptr<CachedResult> Peek(hash_t fingerprint, const string &key);
 
+	//! Records that the unoptimized plan with this key optimizes to the graph
+	//! node `root`. A later query with the same unoptimized plan is the same
+	//! query, so if `root` is cached it can be answered before the optimizer
+	//! runs at all.
+	void SetAlias(hash_t fingerprint, const string &key, hash_t root);
+	//! The cached result an unoptimized plan's alias leads to, if any; sets
+	//! `root` to the graph node it found.
+	shared_ptr<CachedResult> LookupAlias(hash_t fingerprint, const string &key, hash_t &root);
+
 	//! h += 1 for a node whose result could have answered the current query
 	//! (Section III-C, "Importance Factor"), with lazy aging first.
 	void Reference(hash_t fingerprint, idx_t now);
@@ -168,8 +177,14 @@ private:
 	bool FindVictims(double bytes, double benefit, idx_t now, bool force, vector<hash_t> &victims);
 	void Evict(GraphNode &node, idx_t now);
 
+	struct Alias {
+		string key;
+		hash_t root;
+	};
+
 	mutex lock;
 	std::unordered_map<hash_t, GraphNode> graph;
+	std::unordered_map<hash_t, Alias> aliases;
 	idx_t budget = 512ULL * 1024 * 1024;
 	double alpha = 0.99;
 	idx_t bytes_used = 0;
@@ -178,3 +193,4 @@ private:
 };
 
 } // namespace duckdb
+

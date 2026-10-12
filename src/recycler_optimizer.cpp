@@ -120,17 +120,25 @@ static bool DependsOnSurroundingPlan(LogicalOperatorType type) {
 //! LIMIT without an ordering picks an arbitrary set of rows, so the answer
 //! depends on the order its input arrives in. Replacing part of that input with
 //! cached rows could change which rows are picked.
-//! Delimited joins and recursive CTEs are tied by table index to operators
-//! elsewhere in the subtree, so swapping a piece of them is not a local change.
+//! A recursive CTE runs its body repeatedly against the working table, so a
+//! piece of the body is not one result.
+//! A delim join (how DuckDB decorrelates EXISTS and other correlated
+//! subqueries) is blocked unless `below_delim` is set. Recycling below one is
+//! correct - the pieces that read its duplicate-eliminated values (DELIM_GET)
+//! are excluded by DependsOnSurroundingPlan, the binding remap reaches its
+//! duplicate_eliminated_columns, and if a cached scan removes every DELIM_GET
+//! DuckDB plans a plain join instead - but on this workload it was measured to
+//! lose time: the pieces shared there are small, the results stored there large.
 //! A materialized CTE is not listed: its definition and its consumer are each
 //! ordinary plans, and the pieces that read the CTE (CTE_REF) are excluded by
 //! DependsOnSurroundingPlan.
-static bool BlocksDescent(LogicalOperatorType type) {
+static bool BlocksDescent(LogicalOperatorType type, bool below_delim) {
 	switch (type) {
 	case LogicalOperatorType::LOGICAL_LIMIT:
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
 		return true;
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+		return !below_delim;
 	default:
 		return false;
 	}
@@ -321,6 +329,8 @@ struct PlanAnalysis {
 	ClientContext &context;
 	bool preserve_insertion_order;
 	CostParameters parameters;
+	//! Recycle below delim joins too (see BlocksDescent).
+	bool below_delim = false;
 	vector<PlanNode> nodes;
 	vector<DynamicFilterLink> producers;
 	vector<DynamicFilterLink> targets;
@@ -416,7 +426,7 @@ static void AnalyzeOperator(unique_ptr<LogicalOperator> &slot, bool is_root, boo
 		break;
 	}
 
-	auto blocked_below = blocked || BlocksDescent(op.type);
+	auto blocked_below = blocked || BlocksDescent(op.type, analysis.below_delim);
 	for (idx_t i = 0; i < op.children.size(); i++) {
 		auto child_index = analysis.nodes.size();
 		auto child_order = ChildOrderMatters(op, i, order_matters, analysis.preserve_insertion_order);
@@ -750,6 +760,20 @@ public:
 		start = std::chrono::steady_clock::now();
 		started = true;
 		armed = false;
+		ClearUnoptimized();
+	}
+
+	//! The unoptimized plan's key, set by the pre-optimize hook; and whether
+	//! that hook already answered the query from the cache.
+	bool unoptimized_valid = false;
+	hash_t unoptimized_fingerprint = 0;
+	string unoptimized_key;
+	bool answered_early = false;
+
+	void ClearUnoptimized() {
+		unoptimized_valid = false;
+		unoptimized_key.clear();
+		answered_early = false;
 	}
 
 	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
@@ -787,6 +811,82 @@ private:
 };
 
 //===--------------------------------------------------------------------===//
+// Answering repeats before the optimizer runs
+//===--------------------------------------------------------------------===//
+
+static bool PlanIsCacheable(LogicalOperator &op) {
+	if (!OperatorIsCacheable(op)) {
+		return false;
+	}
+	for (auto &child : op.children) {
+		if (!PlanIsCacheable(*child)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! The pre-optimize hook. Exact repeats are where most of the recycler's
+//! gain is, and a repeat's plan is fully optimized - for a many-way join
+//! that is most of its remaining time - only to be thrown away for a cached
+//! scan. So the unoptimized plan is keyed once; if an earlier query with the
+//! same unoptimized plan (the same query) has its result in the recycler
+//! cache, it is substituted here, before any optimizer runs. The alias from
+//! unoptimized key to graph node is recorded by the post-optimize hook.
+static void RecycleBeforeOptimizing(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	auto &state = static_cast<RecyclerState &>(*input.info);
+	auto &context = input.context;
+	if (!BoolSetting(context, "waddle_cache", true)) {
+		return;
+	}
+	auto timer =
+	    context.registered_state->GetOrCreate<QueryTimer>("waddle_query_timer", state.recycler, state.cost_model);
+	timer->ClearUnoptimized();
+
+	reference<unique_ptr<LogicalOperator>> slot = plan;
+	bool executes = true;
+	while (slot.get()->type == LogicalOperatorType::LOGICAL_EXPLAIN && !slot.get()->children.empty()) {
+		if (slot.get()->Cast<LogicalExplain>().explain_type != ExplainType::EXPLAIN_ANALYZE) {
+			executes = false;
+		}
+		slot = slot.get()->children[0];
+	}
+	auto &query = *slot.get();
+	if (ChangesState(query) || !PlanIsCacheable(query)) {
+		return;
+	}
+	string key;
+	if (!SerializePlan(query, key)) {
+		return;
+	}
+	auto fingerprint = HashPlanKey(key);
+	hash_t root = 0;
+	auto cached = state.recycler->LookupAlias(fingerprint, key, root);
+	timer->unoptimized_valid = true;
+	timer->unoptimized_fingerprint = fingerprint;
+	timer->unoptimized_key = std::move(key);
+	if (!cached) {
+		return;
+	}
+	query.ResolveOperatorTypes();
+	auto order_matters = RootOrderMatters(query, Settings::Get<PreserveInsertionOrderSetting>(context));
+	if (cached->types != query.types || (order_matters && !cached->ordered)) {
+		return;
+	}
+	auto rows = cached->data->Count();
+	idx_t now = ++state.queries_seen;
+	if (executes) {
+		state.recycler->Reference(root, now);
+	}
+	slot.get() = make_uniq<LogicalCachedScan>(std::move(cached), input.optimizer.binder.GenerateTableIndex(),
+	                                           order_matters);
+	timer->answered_early = true;
+	state.whole_query_hits++;
+	Log(context, StringUtil::Format("query %llu answered from the recycler cache before optimizing (%llu rows)", now,
+	                                rows));
+}
+
+//===--------------------------------------------------------------------===//
 // The rewriter (Section II, "Changes in Query Evaluation")
 //===--------------------------------------------------------------------===//
 
@@ -808,6 +908,13 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	auto &cost_model = *state.cost_model;
 
 	if (!BoolSetting(context, "waddle_cache", true)) {
+		return;
+	}
+	auto timer =
+	    context.registered_state->GetOrCreate<QueryTimer>("waddle_query_timer", state.recycler, state.cost_model);
+	if (timer->answered_early) {
+		// Already a cached scan: nothing left to do.
+		timer->answered_early = false;
 		return;
 	}
 	auto benefit_policies = BoolSetting(context, "waddle_cost_model", true);
@@ -852,6 +959,7 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 
 	// Key every subtree we could recycle (see ComputeKeys).
 	PlanAnalysis analysis(context, preserve_insertion_order, parameters);
+	analysis.below_delim = BoolSetting(context, "waddle_recycle_below_delim", false);
 	AnalyzeOperator(slot.get(), true, !subtrees_enabled, RootOrderMatters(query, preserve_insertion_order), analysis);
 	ComputeKeys(analysis);
 	auto &nodes = analysis.nodes;
@@ -886,9 +994,14 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		node.cached = match.cached;
 	}
 
+	// The unoptimized plan of this query leads to this root from now on.
+	auto &root = nodes[0];
+	if (executes && root.valid && timer->unoptimized_valid) {
+		recycler.SetAlias(timer->unoptimized_fingerprint, timer->unoptimized_key, root.fingerprint);
+	}
+
 	// 2. Top-down rule: substitute cached results, largest subtree first. A
 	//    hit replaces the subtree and everything inside it.
-	auto &root = nodes[0];
 	string reused;
 	if (root.valid && CanReuse(root.cached, query, root)) {
 		auto rows = root.cached->data->Count();
@@ -1041,6 +1154,17 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 			    !eligible(node) || !assess(node, true)) {
 				continue;
 			}
+			// The paper's store operator passes tuples on "without interrupting
+			// the tuple flow" and cancels buffering once the result is not worth
+			// keeping. Only the streaming form can do that: a materializing one
+			// is a pipeline breaker that collects the whole result before it can
+			// decide, and a speculative result's size is unknown. Below the root
+			// - typically on a large join - such a store can cost more than the
+			// query it sits in. The final result itself, the paper's first
+			// example of a small result, may still be materialized.
+			if (node.mode == CaptureMode::MATERIALIZING && !node.is_root) {
+				continue;
+			}
 			add_store(i, true);
 		}
 	} else {
@@ -1076,8 +1200,6 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		}
 	}
 	if (root.valid) {
-		auto timer = context.registered_state->GetOrCreate<QueryTimer>("waddle_query_timer", state.recycler,
-		                                                               state.cost_model);
 		timer->Arm(root.cost / threads, std::move(computed));
 	}
 
@@ -1119,9 +1241,11 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 
 OptimizerExtension CreateRecyclerOptimizer(shared_ptr<RecyclerState> state) {
 	OptimizerExtension extension;
+	extension.pre_optimize_function = RecycleBeforeOptimizing;
 	extension.optimize_function = RecycleResults;
 	extension.optimizer_info = std::move(state);
 	return extension;
 }
 
 } // namespace duckdb
+
