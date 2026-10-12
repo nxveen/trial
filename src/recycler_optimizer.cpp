@@ -5,6 +5,7 @@
 #include "recycler.hpp"
 #include "plan_key.hpp"
 #include "plan_rewrite.hpp"
+#include "subquery_pushdown.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -836,6 +837,14 @@ static bool PlanIsCacheable(LogicalOperator &op) {
 static void RecycleBeforeOptimizing(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	auto &state = static_cast<RecyclerState &>(*input.info);
 	auto &context = input.context;
+	// Not recycling, but it shapes every plan the recycler sees, so it runs
+	// first: move decorrelated subqueries down to what they depend on.
+	if (BoolSetting(context, "waddle_decorrelate_exists", true)) {
+		state.subqueries_decorrelated += DecorrelateExistsSubqueries(plan);
+	}
+	if (BoolSetting(context, "waddle_push_subqueries", true)) {
+		state.subqueries_pushed += PushDownCorrelatedSubqueries(context, plan);
+	}
 	if (!BoolSetting(context, "waddle_cache", true)) {
 		return;
 	}
@@ -922,6 +931,7 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	recycler.Configure(CountSetting(context, "waddle_cache_limit_mb", 512) * 1024 * 1024, alpha);
 	auto root_row_limit = CountSetting(context, "waddle_cache_max_rows", 200000);
 	auto subtree_row_limit = CountSetting(context, "waddle_subtree_max_rows", 200000);
+	auto aggregate_row_limit = CountSetting(context, "waddle_aggregate_max_rows", 10000000);
 	auto min_operators = CountSetting(context, "waddle_min_subtree_operators", 1);
 	auto min_work = CountSetting(context, "waddle_min_subtree_work", 0);
 	auto max_subtree_stores = CountSetting(context, "waddle_max_subtree_captures", 4);
@@ -1069,8 +1079,18 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		return node.cost / threads * correction;
 	};
 	auto max_bytes = recycler.MaxEntryBytes();
+	//! An aggregation's result is compact and already built in a hash table:
+	//! copying even a large one costs little next to computing it, so it gets
+	//! its own, much higher limit (the per-entry byte limit still applies).
 	auto row_limit = [&](const PlanNode &node) {
-		return node.is_root ? root_row_limit : subtree_row_limit;
+		if (node.is_root) {
+			return root_row_limit;
+		}
+		auto type = node.slot->get()->type;
+		if (type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || type == LogicalOperatorType::LOGICAL_DISTINCT) {
+			return MaxValue(aggregate_row_limit, subtree_row_limit);
+		}
+		return subtree_row_limit;
 	};
 	auto eligible = [&](const PlanNode &node) {
 		if (node.replaced || node.reused || !node.capturable || node.cached) {

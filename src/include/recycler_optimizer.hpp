@@ -24,6 +24,10 @@ struct RecyclerState : public OptimizerExtensionInfo {
 	//! History candidates the admission/replacement policy turned down at
 	//! rewrite time.
 	atomic<idx_t> not_admitted {0};
+	//! Correlated subqueries moved down to what they depend on.
+	atomic<idx_t> subqueries_pushed {0};
+	//! EXISTS / NOT EXISTS subqueries turned into semi / anti joins.
+	atomic<idx_t> subqueries_decorrelated {0};
 
 	//! Empties the cache, forgets the recycler graph and zeroes every counter.
 	void Reset() {
@@ -37,6 +41,8 @@ struct RecyclerState : public OptimizerExtensionInfo {
 		history_stores = 0;
 		speculative_stores = 0;
 		not_admitted = 0;
+		subqueries_pushed = 0;
+		subqueries_decorrelated = 0;
 	}
 };
 
@@ -44,3 +50,4 @@ struct RecyclerState : public OptimizerExtensionInfo {
 OptimizerExtension CreateRecyclerOptimizer(shared_ptr<RecyclerState> state);
 
 } // namespace duckdb
+

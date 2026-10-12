@@ -51,6 +51,8 @@ static unique_ptr<FunctionData> StatsBind(ClientContext &context, TableFunctionB
 	add("history_stores", state.history_stores.load());
 	add("speculative_stores", state.speculative_stores.load());
 	add("not_admitted", state.not_admitted.load());
+	add("subqueries_pushed", state.subqueries_pushed.load());
+	add("subqueries_decorrelated", state.subqueries_decorrelated.load());
 	add("admissions", recycler.admissions);
 	add("replacements_rejected", recycler.replacements_rejected);
 	add("evictions", recycler.evictions);
@@ -102,6 +104,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_subtree_max_rows", "Largest subtree result worth caching, in rows",
 	                          LogicalType::BIGINT, Value::BIGINT(200000));
+	config.AddExtensionOption("waddle_aggregate_max_rows",
+	                          "Largest aggregation result worth caching, in rows (aggregations are compact)",
+	                          LogicalType::BIGINT, Value::BIGINT(10000000));
 	config.AddExtensionOption("waddle_min_subtree_operators", "Smallest subtree worth caching, in operators",
 	                          LogicalType::BIGINT, Value::BIGINT(1));
 	config.AddExtensionOption("waddle_min_subtree_work",
@@ -122,6 +127,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("waddle_recycle_below_delim",
 	                          "Also recycle subtrees below delim joins (decorrelated EXISTS / correlated subqueries)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("waddle_decorrelate_exists",
+	                          "Turn EXISTS / NOT EXISTS subqueries correlated by one equality into semi / anti joins",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("waddle_push_subqueries",
+	                          "Evaluate correlated EXISTS / IN subqueries on the tables they depend on, before "
+	                          "the outer query's other joins", LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_log", "Print what the recycler does with each query", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false));
 

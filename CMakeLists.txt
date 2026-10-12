@@ -19,6 +19,7 @@ set(EXTENSION_SOURCES
     src/plan_rewrite.cpp
     src/cost_model.cpp
     src/recycler.cpp
+    src/subquery_pushdown.cpp
     src/cache_operators.cpp
     src/recycler_optimizer.cpp)
 
@@ -30,3 +31,4 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
