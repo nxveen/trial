@@ -97,7 +97,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("waddle_cache", "Reuse results computed earlier in this session", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_cache_limit_mb", "Memory the result cache may use, in MB", LogicalType::BIGINT,
-	                          Value::BIGINT(1536));
+	                          Value::BIGINT(512));
 	config.AddExtensionOption("waddle_cache_max_rows", "Largest whole-query result worth caching, in rows",
 	                          LogicalType::BIGINT, Value::BIGINT(200000));
 	config.AddExtensionOption("waddle_subtree_reuse", "Also cache and reuse subtrees shared between queries",
