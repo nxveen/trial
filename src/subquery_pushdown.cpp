@@ -82,13 +82,25 @@ static idx_t LargestTable(ClientContext &context, LogicalOperator &op) {
 	return largest;
 }
 
+static thread_local bool push_semi_joins = true;
+static bool PushSemiJoins() {
+	return push_semi_joins;
+}
+
 static bool TryPushDown(ClientContext &context, unique_ptr<LogicalOperator> &slot) {
 	auto &op = *slot;
-	if (op.type != LogicalOperatorType::LOGICAL_DELIM_JOIN || op.children.size() != 2) {
+	bool is_delim = op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
+	// Plain semi / anti joins too: the ones DecorrelateExistsSubqueries made, and
+	// IN (subquery). Left to itself, the optimizer may order them after large
+	// joins; the same rule as for delim joins pins them to what they depend on.
+	bool is_semi = op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && PushSemiJoins() &&
+	               (op.Cast<LogicalComparisonJoin>().join_type == JoinType::SEMI ||
+	                op.Cast<LogicalComparisonJoin>().join_type == JoinType::ANTI);
+	if ((!is_delim && !is_semi) || op.children.size() != 2) {
 		return false;
 	}
 	auto &delim = op.Cast<LogicalComparisonJoin>();
-	if (delim.delim_flipped || delim.HasProjectionMap()) {
+	if ((is_delim && delim.delim_flipped) || delim.HasProjectionMap()) {
 		return false;
 	}
 	switch (delim.join_type) {
@@ -153,7 +165,8 @@ static idx_t PushDownRecursive(ClientContext &context, unique_ptr<LogicalOperato
 	return moved;
 }
 
-idx_t PushDownCorrelatedSubqueries(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+idx_t PushDownCorrelatedSubqueries(ClientContext &context, unique_ptr<LogicalOperator> &plan, bool semi_joins) {
+	push_semi_joins = semi_joins;
 	return PushDownRecursive(context, plan);
 }
 

@@ -27,7 +27,7 @@ class ClientContext;
 //!
 //! Runs before the optimizer, which then plans the joins around the smaller
 //! input. Returns the number of subqueries moved.
-idx_t PushDownCorrelatedSubqueries(ClientContext &context, unique_ptr<LogicalOperator> &plan);
+idx_t PushDownCorrelatedSubqueries(ClientContext &context, unique_ptr<LogicalOperator> &plan, bool semi_joins);
 
 //! Turns WHERE [NOT] EXISTS subqueries correlated by a single equality into
 //! plain SEMI / ANTI joins, which the optimizer can place and order freely,

@@ -130,6 +130,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("waddle_decorrelate_exists",
 	                          "Turn EXISTS / NOT EXISTS subqueries correlated by one equality into semi / anti joins",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("waddle_push_semi_joins",
+	                          "Also move semi / anti joins (EXISTS rewritten, IN subqueries) down to what they depend on",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_push_subqueries",
 	                          "Evaluate correlated EXISTS / IN subqueries on the tables they depend on, before "
 	                          "the outer query's other joins", LogicalType::BOOLEAN, Value::BOOLEAN(true));

@@ -843,7 +843,8 @@ static void RecycleBeforeOptimizing(OptimizerExtensionInput &input, unique_ptr<L
 		state.subqueries_decorrelated += DecorrelateExistsSubqueries(plan);
 	}
 	if (BoolSetting(context, "waddle_push_subqueries", true)) {
-		state.subqueries_pushed += PushDownCorrelatedSubqueries(context, plan);
+		state.subqueries_pushed +=
+		    PushDownCorrelatedSubqueries(context, plan, BoolSetting(context, "waddle_push_semi_joins", true));
 	}
 	if (!BoolSetting(context, "waddle_cache", true)) {
 		return;
