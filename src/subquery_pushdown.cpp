@@ -1,5 +1,5 @@
 #include "subquery_pushdown.hpp"
-
+#include "cost_model.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -10,12 +10,9 @@
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
-
 #include <algorithm>
 #include <functional>
-
 namespace duckdb {
-
 static void CollectBindings(const Expression &expr, vector<ColumnBinding> &out) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		out.push_back(expr.Cast<BoundColumnRefExpression>().binding);
@@ -24,7 +21,7 @@ static void CollectBindings(const Expression &expr, vector<ColumnBinding> &out) 
 	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) { CollectBindings(child, out); });
 }
 
-//! True if `op` produces every one of `needed`.
+// True if `op` produces every one of `needed`.
 static bool Provides(LogicalOperator &op, const vector<ColumnBinding> &needed) {
 	auto bindings = op.GetColumnBindings();
 	for (auto &binding : needed) {
@@ -35,11 +32,7 @@ static bool Provides(LogicalOperator &op, const vector<ColumnBinding> &needed) {
 	return true;
 }
 
-//! The inputs of `op` the subquery may be moved into: inputs whose every row
-//! and column `op` passes on unchanged (under the same bindings), only
-//! dropping, duplicating or extending rows. Both inputs of an inner join or
-//! cross product; only the preserved (left) input of a LEFT join, whose rows
-//! all survive it - its right input is padded with NULLs, so it is not.
+// The inputs of `op` the subquery may be moved into: inputs whose every row and column `op` passes on unchanged...
 static vector<idx_t> PassThroughInputs(LogicalOperator &op) {
 	if (op.children.size() != 2) {
 		return {};
@@ -62,19 +55,11 @@ static vector<idx_t> PassThroughInputs(LogicalOperator &op) {
 	return {};
 }
 
-//! The row count of the largest base table scanned in a subtree: a rough,
-//! estimate-free measure of how many rows it can produce. (Estimates built from
-//! guessed predicate selectivities were tried and chose worse on this workload.)
+// The row count of the largest base table scanned in a subtree: a rough, estimate-free measure of how many rows...
 static idx_t LargestTable(ClientContext &context, LogicalOperator &op) {
 	idx_t largest = 0;
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		if (get.function.cardinality) {
-			auto stats = get.function.cardinality(context, get.bind_data.get());
-			if (stats && stats->has_estimated_cardinality) {
-				largest = stats->estimated_cardinality;
-			}
-		}
+		largest = CostModel::TableRows(context, op.Cast<LogicalGet>());
 	}
 	for (auto &child : op.children) {
 		largest = MaxValue(largest, LargestTable(context, *child));
@@ -82,18 +67,10 @@ static idx_t LargestTable(ClientContext &context, LogicalOperator &op) {
 	return largest;
 }
 
-static thread_local bool push_semi_joins = true;
-static bool PushSemiJoins() {
-	return push_semi_joins;
-}
-
-static bool TryPushDown(ClientContext &context, unique_ptr<LogicalOperator> &slot) {
+static bool TryPushDown(ClientContext &context, unique_ptr<LogicalOperator> &slot, bool semi_joins) {
 	auto &op = *slot;
 	bool is_delim = op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
-	// Plain semi / anti joins too: the ones DecorrelateExistsSubqueries made, and
-	// IN (subquery). Left to itself, the optimizer may order them after large
-	// joins; the same rule as for delim joins pins them to what they depend on.
-	bool is_semi = op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && PushSemiJoins() &&
+	bool is_semi = op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && semi_joins &&
 	               (op.Cast<LogicalComparisonJoin>().join_type == JoinType::SEMI ||
 	                op.Cast<LogicalComparisonJoin>().join_type == JoinType::ANTI);
 	if ((!is_delim && !is_semi) || op.children.size() != 2) {
@@ -111,7 +88,6 @@ static bool TryPushDown(ClientContext &context, unique_ptr<LogicalOperator> &slo
 	default:
 		return false;
 	}
-	// Every column of the outer query the subquery depends on.
 	vector<ColumnBinding> needed;
 	for (auto &column : delim.duplicate_eliminated_columns) {
 		CollectBindings(*column, needed);
@@ -122,8 +98,6 @@ static bool TryPushDown(ClientContext &context, unique_ptr<LogicalOperator> &slo
 	if (needed.empty()) {
 		return false;
 	}
-	// Walk down the left side while one input of a pass-through join still
-	// provides all of them.
 	unique_ptr<LogicalOperator> *target = &delim.children[0];
 	while (true) {
 		unique_ptr<LogicalOperator> *next = nullptr;
@@ -142,8 +116,6 @@ static bool TryPushDown(ClientContext &context, unique_ptr<LogicalOperator> &slo
 	if (target == &delim.children[0]) {
 		return false;
 	}
-	// Only worth it if the subquery then sees fewer rows: never move it onto
-	// the largest table of the outer query.
 	if (LargestTable(context, **target) >= LargestTable(context, *delim.children[0])) {
 		return false;
 	}
@@ -154,28 +126,22 @@ static bool TryPushDown(ClientContext &context, unique_ptr<LogicalOperator> &slo
 	return true;
 }
 
-static idx_t PushDownRecursive(ClientContext &context, unique_ptr<LogicalOperator> &slot) {
+static idx_t PushDownRecursive(ClientContext &context, unique_ptr<LogicalOperator> &slot, bool semi_joins) {
 	idx_t moved = 0;
 	for (auto &child : slot->children) {
-		moved += PushDownRecursive(context, child);
+		moved += PushDownRecursive(context, child, semi_joins);
 	}
-	if (TryPushDown(context, slot)) {
+	if (TryPushDown(context, slot, semi_joins)) {
 		moved++;
 	}
 	return moved;
 }
 
 idx_t PushDownCorrelatedSubqueries(ClientContext &context, unique_ptr<LogicalOperator> &plan, bool semi_joins) {
-	push_semi_joins = semi_joins;
-	return PushDownRecursive(context, plan);
+	return PushDownRecursive(context, plan, semi_joins);
 }
 
-
-//===--------------------------------------------------------------------===//
-// EXISTS / NOT EXISTS on an equality: semi and anti joins
-//===--------------------------------------------------------------------===//
-
-//! Counts references to `binding` in the expressions of a whole plan.
+// Counts references to `binding` in the expressions of a whole plan.
 static idx_t CountReferences(LogicalOperator &op, const ColumnBinding &binding) {
 	idx_t count = 0;
 	std::function<void(const Expression &)> visit = [&](const Expression &expr) {
@@ -187,7 +153,6 @@ static idx_t CountReferences(LogicalOperator &op, const ColumnBinding &binding) 
 	};
 	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *child) { visit(**child); });
 	if (op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN || op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		// Conditions and duplicate-eliminated columns are enumerated above.
 	}
 	for (auto &child : op.children) {
 		count += CountReferences(*child, binding);
@@ -218,27 +183,7 @@ static bool ContainsDelimGet(LogicalOperator &op) {
 	return false;
 }
 
-//! Rewrites `delim_slot` - a decorrelated EXISTS (a MARK delim join) whose
-//! mark is used as `mark` or `NOT mark` in `filter` - into a plain SEMI or ANTI
-//! join. Only the shape DuckDB produces for an EXISTS correlated by a single
-//! equality is accepted:
-//!     DELIM_JOIN MARK  [outer.col IS NOT DISTINCT FROM P.k]
-//!       outer
-//!       P: PROJECTION (..., k: delim.col, ...)
-//!            FILTER (inner.col = delim.col AND rest)
-//!              CROSS_PRODUCT (inner, DELIM_GET)
-//! and becomes
-//!     SEMI / ANTI JOIN  [outer.col = P.k]
-//!       outer
-//!       P: PROJECTION (..., k: inner.col, ...)
-//!            FILTER (rest)
-//!              inner
-//! EXISTS (... WHERE inner.col = outer.col AND rest) is exactly "some row of
-//! inner satisfying rest has inner.col = outer.col": a semi join on equality,
-//! which, like EXISTS, never matches a NULL; NOT EXISTS is its anti join, which
-//! keeps a row with a NULL key just as NOT EXISTS does. The query optimizer can
-//! then place and order these joins itself, which it cannot do with a delim
-//! join - and the delim join's duplicate elimination disappears.
+// Rewrites `delim_slot` - a decorrelated EXISTS (a MARK delim join) whose mark is used as `mark` or `NOT mark`...
 static bool TryDecorrelate(LogicalOperator &root, LogicalOperator &filter, unique_ptr<LogicalOperator> &delim_slot) {
 	auto &delim = delim_slot->Cast<LogicalComparisonJoin>();
 	if (delim.join_type != JoinType::MARK || delim.delim_flipped || delim.HasProjectionMap() ||
@@ -246,8 +191,7 @@ static bool TryDecorrelate(LogicalOperator &root, LogicalOperator &filter, uniqu
 	    delim.conditions[0].comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 		return false;
 	}
-	// The mark must be used exactly once in the whole plan: as `mark` or
-	// `NOT mark`, a conjunct of this filter.
+	// The mark must be used exactly once in the whole plan: as `mark` or `NOT mark`, a conjunct of this filter.
 	ColumnBinding mark(delim.mark_index, 0);
 	if (CountReferences(root, mark) != 1) {
 		return false;
@@ -272,7 +216,6 @@ static bool TryDecorrelate(LogicalOperator &root, LogicalOperator &filter, uniqu
 	if (conjunct == DConstants::INVALID_INDEX) {
 		return false;
 	}
-	// The subquery side: PROJECTION -> FILTER -> CROSS_PRODUCT(inner, DELIM_GET).
 	auto &projection = *delim.children[1];
 	if (projection.type != LogicalOperatorType::LOGICAL_PROJECTION || projection.children.size() != 1) {
 		return false;
@@ -293,7 +236,6 @@ static bool TryDecorrelate(LogicalOperator &root, LogicalOperator &filter, uniqu
 	}
 	auto delim_index = delim_get.GetTableIndex()[0];
 	ColumnBinding delim_column(delim_index, 0);
-	// Exactly one conjunct uses the delim values: inner.col = delim.col.
 	idx_t equality = DConstants::INVALID_INDEX;
 	unique_ptr<Expression> inner_column;
 	for (idx_t i = 0; i < inner_filter.expressions.size(); i++) {
@@ -321,7 +263,6 @@ static bool TryDecorrelate(LogicalOperator &root, LogicalOperator &filter, uniqu
 	if (equality == DConstants::INVALID_INDEX) {
 		return false;
 	}
-	// The projection may only pass the delim column through as is.
 	for (auto &expr : projection.expressions) {
 		if (References(*expr, delim_index) &&
 		    !(expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
@@ -329,13 +270,10 @@ static bool TryDecorrelate(LogicalOperator &root, LogicalOperator &filter, uniqu
 			return false;
 		}
 	}
-	// The inner column must stand in for the delim column without a cast.
 	auto &delim_types = delim_get.Cast<LogicalDelimGet>().chunk_types;
 	if (delim_types.empty() || inner_column->return_type != delim_types[0]) {
 		return false;
 	}
-
-	// All checks passed: rewrite.
 	for (auto &expr : projection.expressions) {
 		if (References(*expr, delim_index)) {
 			expr = inner_column->Copy();
@@ -367,8 +305,6 @@ static idx_t DecorrelateRecursive(LogicalOperator &root, unique_ptr<LogicalOpera
 	if (slot->type != LogicalOperatorType::LOGICAL_FILTER || slot->children.size() != 1) {
 		return rewritten;
 	}
-	// The delim joins of a WHERE clause's subqueries sit in a chain below its
-	// FILTER, each on the left side of the next.
 	auto &filter = *slot;
 	reference<unique_ptr<LogicalOperator>> current = filter.children[0];
 	while (current.get()->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
@@ -392,6 +328,5 @@ static idx_t DecorrelateRecursive(LogicalOperator &root, unique_ptr<LogicalOpera
 idx_t DecorrelateExistsSubqueries(unique_ptr<LogicalOperator> &plan) {
 	return DecorrelateRecursive(*plan, plan);
 }
-
-} // namespace duckdb
+}
 

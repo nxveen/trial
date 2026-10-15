@@ -1,5 +1,5 @@
 #include "recycler_optimizer.hpp"
-
+#include "duckdb/main/config.hpp"
 #include "cache_operators.hpp"
 #include "cost_model.hpp"
 #include "recycler.hpp"
@@ -24,21 +24,11 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <unordered_map>
-
 namespace duckdb {
-
-//===--------------------------------------------------------------------===//
-// What may be cached
-//===--------------------------------------------------------------------===//
-
-//! Operators we understand well enough to promise that the same plan always
-//! produces the same rows. Anything not on this list makes the plan
-//! uncacheable - an allowlist, so a DuckDB operator we have never seen cannot
-//! quietly become a wrong answer.
+// Operators we understand well enough to promise that the same plan always produces the same rows.
 static bool IsPureReadOperator(LogicalOperatorType type) {
 	switch (type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
@@ -73,8 +63,7 @@ static bool IsPureReadOperator(LogicalOperatorType type) {
 	}
 }
 
-//! Statements that change what later queries should see: data, schema,
-//! settings, or transaction state. Any of these empties the cache.
+// Statements that change what later queries should see: data, schema, settings, or transaction state.
 static bool ChangesDatabaseState(LogicalOperatorType type) {
 	switch (type) {
 	case LogicalOperatorType::LOGICAL_INSERT:
@@ -109,38 +98,19 @@ static bool ChangesDatabaseState(LogicalOperatorType type) {
 	}
 }
 
-//! Operators that read something produced elsewhere in the same plan. A
-//! subtree containing one of these is not self-contained: on its own it would
-//! have nothing to read from, so it can never be cached or replaced by itself.
+// Operators that read something produced elsewhere in the same plan.
 static bool DependsOnSurroundingPlan(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_DELIM_GET || type == LogicalOperatorType::LOGICAL_CTE_REF;
 }
 
-//! Regions of a plan we leave alone when working below the root.
-//!
-//! LIMIT without an ordering picks an arbitrary set of rows, so the answer
-//! depends on the order its input arrives in. Replacing part of that input with
-//! cached rows could change which rows are picked. (A LIMIT directly over a
-//! sort is the exception: see LimitOverSort.)
-//! A recursive CTE runs its body repeatedly against the working table, so a
-//! piece of the body is not one result.
-//! A delim join (how DuckDB decorrelates EXISTS and other correlated
-//! subqueries) is blocked unless `below_delim` is set. Recycling below one is
-//! correct - the pieces that read its duplicate-eliminated values (DELIM_GET)
-//! are excluded by DependsOnSurroundingPlan, the binding remap reaches its
-//! duplicate_eliminated_columns, and if a cached scan removes every DELIM_GET
-//! DuckDB plans a plain join instead - but on this workload it was measured to
-//! lose time: the pieces shared there are small, the results stored there large.
-//! A materialized CTE is not listed: its definition and its consumer are each
-//! ordinary plans, and the pieces that read the CTE (CTE_REF) are excluded by
-//! DependsOnSurroundingPlan.
-static bool BlocksDescent(LogicalOperatorType type, bool below_delim) {
+// Regions of a plan we leave alone when working below the root.
+static bool BlocksDescent(LogicalOperatorType type) {
 	switch (type) {
 	case LogicalOperatorType::LOGICAL_LIMIT:
 	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
 		return true;
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-		return !below_delim;
+		return true;
 	default:
 		return false;
 	}
@@ -150,12 +120,9 @@ static bool ExpressionsAreStable(LogicalOperator &op) {
 	bool stable = true;
 	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *child) {
 		auto &expr = **child;
-		// Volatile: random(). Inconsistent between queries: now(), currval().
 		if (expr.IsVolatile() || !expr.IsConsistent()) {
 			stable = false;
 		}
-		// A prepared statement's parameters are filled in per execution, so the
-		// same plan can produce different rows.
 		if (expr.GetExpressionClass() == ExpressionClass::BOUND_PARAMETER) {
 			stable = false;
 		}
@@ -163,14 +130,12 @@ static bool ExpressionsAreStable(LogicalOperator &op) {
 	return stable;
 }
 
-//! Whether this one operator, ignoring its children, may be part of a cached plan.
+// Whether this one operator, ignoring its children, may be part of a cached plan.
 static bool OperatorIsCacheable(LogicalOperator &op) {
 	if (!IsPureReadOperator(op.type)) {
 		return false;
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		// Only base tables. A table function may read a file or a system view
-		// that changes underneath us without any statement telling us so.
 		if (!op.Cast<LogicalGet>().GetTable()) {
 			return false;
 		}
@@ -190,13 +155,7 @@ static bool ChangesState(LogicalOperator &op) {
 	return false;
 }
 
-//===--------------------------------------------------------------------===//
-// Where the order of rows is observable
-//===--------------------------------------------------------------------===//
-
-//! Whether the order of the query's own result matters: with
-//! preserve_insertion_order on it always does, otherwise only when the query
-//! ends in an ORDER BY (possibly under projections, filters or a LIMIT).
+// Whether the order of the query's own result matters: with preserve_insertion_order on it always does...
 static bool RootOrderMatters(LogicalOperator &root, bool preserve_insertion_order) {
 	if (preserve_insertion_order) {
 		return true;
@@ -221,8 +180,7 @@ static bool RootOrderMatters(LogicalOperator &root, bool preserve_insertion_orde
 	}
 }
 
-//! Whether the order in which child `child_idx` produces its rows can change
-//! what `parent` produces, given whether the parent's own order matters.
+// Whether the order in which child `child_idx` produces its rows can change what `parent` produces, given...
 static bool ChildOrderMatters(LogicalOperator &parent, idx_t child_idx, bool parent_order_matters,
                               bool preserve_insertion_order) {
 	switch (parent.type) {
@@ -241,7 +199,6 @@ static bool ChildOrderMatters(LogicalOperator &parent, idx_t child_idx, bool par
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 	case LogicalOperatorType::LOGICAL_ANY_JOIN:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-		// The build side (child 1) is consumed whole before anything comes out.
 		return child_idx == 0 ? parent_order_matters : false;
 	case LogicalOperatorType::LOGICAL_WINDOW:
 		return preserve_insertion_order;
@@ -252,104 +209,53 @@ static bool ChildOrderMatters(LogicalOperator &parent, idx_t child_idx, bool par
 	}
 }
 
-//===--------------------------------------------------------------------===//
-// Analysing a plan
-//===--------------------------------------------------------------------===//
-
-//! One operator of the plan, and the subtree under it. Nodes are stored in
-//! preorder, so the subtree of node i is exactly nodes [i, end).
 struct PlanNode {
 	unique_ptr<LogicalOperator> *slot = nullptr;
 	idx_t end = 0;
-	//! The node above, and which of its children this is (root: INVALID_INDEX).
 	idx_t parent = DConstants::INVALID_INDEX;
 	idx_t child_index = 0;
 	bool is_root = false;
-	//! The root, or outside every region BlocksDescent names.
 	bool eligible = false;
 	bool order_matters = false;
-	//! Every operator in the subtree passes OperatorIsCacheable.
 	bool pure = false;
-	//! Some operator in the subtree reads what another part of the plan made.
 	bool dependent = false;
 	idx_t operators = 0;
-	//! Rows flowing through the subtree plus the rows of every base table it
-	//! scans. Only used by the waddle_min_subtree_work floor.
 	idx_t work = 0;
 	idx_t rows = 0;
-
-	//! The cost model's view: what recomputing the subtree costs, and how big
-	//! its result is expected to be.
 	double cost = 0;
-	//! The same, before any subtree below was replaced by a cached result:
-	//! the estimated base cost (from base tables only).
 	double base_cost = 0;
 	double estimated_rows = 0;
 	double estimated_bytes = 0;
-
-	//! Set once the whole plan has been analysed. `valid`: may be looked up
-	//! and replaced by a cached result. `capturable`: may also be captured.
 	bool valid = false;
 	bool capturable = false;
 	string key;
 	hash_t fingerprint = 0;
-	//! Inside a subtree that was swapped for cached rows. Its slot no longer
-	//! exists and must not be touched.
 	bool replaced = false;
-
-	//! Matching against the recycler graph (Section III-A): whether the node
-	//! existed before this query (an exact match), and its cached result.
 	bool existed = false;
 	shared_ptr<CachedResult> cached;
-	//! Replaced by its cached result in this query (the node itself).
 	bool reused = false;
-	//! What the recycler expects from storing this node, if considered.
 	Recycler::Assessment assessment;
 	CaptureMode mode = CaptureMode::MATERIALIZING;
 };
 
-//! A runtime filter, identified by the object both ends share.
 struct DynamicFilterLink {
 	const void *filter;
 	idx_t node;
 };
 
-//! Everything we learn about a plan in one walk over it.
-//!
-//! DuckDB pushes filters into table scans at runtime: a hash join pushes the
-//! min/max (and a bloom filter) of its build side into scans on its probe
-//! side, and a Top-N pushes its current boundary into the scans below it. A
-//! scan that receives such a filter from outside a subtree makes that subtree
-//! return fewer rows than it would on its own, so its rows are only valid in
-//! this query. `producers` and `targets` record both ends of every such
-//! filter, so a subtree can be checked for one that crosses its boundary.
 struct PlanAnalysis {
 	PlanAnalysis(ClientContext &context, bool preserve_insertion_order, CostParameters parameters)
 	    : context(context), preserve_insertion_order(preserve_insertion_order), parameters(parameters) {
 	}
-
 	ClientContext &context;
 	bool preserve_insertion_order;
 	CostParameters parameters;
-	//! Recycle below delim joins too (see BlocksDescent).
-	bool below_delim = false;
 	vector<PlanNode> nodes;
 	vector<DynamicFilterLink> producers;
 	vector<DynamicFilterLink> targets;
 };
 
-static idx_t BaseTableRows(ClientContext &context, LogicalGet &get) {
-	if (!get.function.cardinality) {
-		return 0;
-	}
-	auto stats = get.function.cardinality(context, get.bind_data.get());
-	if (!stats || !stats->has_estimated_cardinality) {
-		return 0;
-	}
-	return stats->estimated_cardinality;
-}
-
-//! Collects the Top-N dynamic filters inside one pushed-down table filter.
+// Collects the Top-N dynamic filters inside one pushed-down table filter.
 static void FindDynamicFilters(const TableFilter &filter, idx_t node, vector<DynamicFilterLink> &out) {
 	switch (filter.filter_type) {
 	case TableFilterType::DYNAMIC_FILTER:
@@ -380,11 +286,7 @@ static void FindDynamicFilters(const TableFilter &filter, idx_t node, vector<Dyn
 	}
 }
 
-//! True if `op` is a LIMIT whose input is a sort (through projections only).
-//! Such a LIMIT picks rows by the sort order, which does not depend on the
-//! order its input arrives in - unlike a LIMIT over unordered rows - so it
-//! need not block recycling below it. (A paged or re-sorted variant of a query
-//! can then reuse everything up to, and even including, the sort.)
+// True if `op` is a LIMIT whose input is a sort (through projections only).
 static bool LimitOverSort(LogicalOperator &op) {
 	if (op.type != LogicalOperatorType::LOGICAL_LIMIT || op.children.size() != 1) {
 		return false;
@@ -404,18 +306,16 @@ static void AnalyzeOperator(unique_ptr<LogicalOperator> &slot, bool is_root, boo
 	analysis.nodes.emplace_back();
 	analysis.nodes[index].parent = parent;
 	analysis.nodes[index].child_index = child_index;
-
 	bool pure = OperatorIsCacheable(op);
 	bool dependent = DependsOnSurroundingPlan(op.type);
 	idx_t operators = 1;
 	idx_t work = op.has_estimated_cardinality ? op.estimated_cardinality : 0;
 	double cost = CostModel::OperatorCost(op, analysis.context, analysis.parameters);
-
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op.Cast<LogicalGet>();
 		if (get.GetTable()) {
-			work += BaseTableRows(analysis.context, get);
+			work += CostModel::TableRows(analysis.context, get);
 		}
 		if (get.dynamic_filters) {
 			analysis.targets.push_back(DynamicFilterLink {get.dynamic_filters.get(), index});
@@ -444,8 +344,7 @@ static void AnalyzeOperator(unique_ptr<LogicalOperator> &slot, bool is_root, boo
 	default:
 		break;
 	}
-
-	auto blocked_below = blocked || (BlocksDescent(op.type, analysis.below_delim) && !LimitOverSort(op));
+	auto blocked_below = blocked || (BlocksDescent(op.type) && !LimitOverSort(op));
 	for (idx_t i = 0; i < op.children.size(); i++) {
 		auto child_index = analysis.nodes.size();
 		auto child_order = ChildOrderMatters(op, i, order_matters, analysis.preserve_insertion_order);
@@ -457,8 +356,6 @@ static void AnalyzeOperator(unique_ptr<LogicalOperator> &slot, bool is_root, boo
 		work += child.work;
 		cost += child.cost;
 	}
-
-	// Taken only now: the recursion above may have reallocated `nodes`.
 	auto &node = analysis.nodes[index];
 	node.slot = &slot;
 	node.end = analysis.nodes.size();
@@ -472,16 +369,11 @@ static void AnalyzeOperator(unique_ptr<LogicalOperator> &slot, bool is_root, boo
 	node.cost = cost;
 	node.base_cost = cost;
 	node.estimated_rows = CostModel::EstimatedRows(op);
-	// Not the operator's own estimate alone: operators added by late optimizer
-	// passes (the projections of compressed materialization, above an ORDER BY)
-	// have none, which used to read as "unbounded" and kept every such query
-	// out of the cache.
 	node.rows = static_cast<idx_t>(node.estimated_rows);
 	node.estimated_bytes = node.estimated_rows * CostModel::RowBytes(op.types);
 }
 
-//! True if every runtime filter that reaches a scan inside nodes [begin, end)
-//! also comes from inside it.
+// True if every runtime filter that reaches a scan inside nodes [begin, end) also comes from inside it.
 static bool DynamicFiltersStayInside(const PlanAnalysis &analysis, idx_t begin, idx_t end) {
 	for (auto &target : analysis.targets) {
 		if (target.node < begin || target.node >= end) {
@@ -498,27 +390,14 @@ static bool DynamicFiltersStayInside(const PlanAnalysis &analysis, idx_t begin, 
 			}
 		}
 		if (!found) {
-			// A filter we cannot trace to an operator: assume it comes from outside.
 			return false;
 		}
 	}
 	return true;
 }
-
-//! Decides which subtrees may be replaced or captured, and takes their keys.
-//! Every key is taken before the plan is changed in any way: a cached scan
-//! or a capture operator in the plan would change the bytes.
-//!
-//! A runtime filter reaching into a subtree from outside only matters for
-//! capturing it: the rows it would produce in this query are incomplete. It
-//! does not stop the subtree from being replaced by a complete cached result:
-//! such a filter only removes rows that its join (or Top-N) drops anyway, so
-//! the extra rows change nothing above.
+// Decides which subtrees may be replaced or captured, and takes their keys.
 static void ComputeKeys(PlanAnalysis &analysis) {
 	auto &nodes = analysis.nodes;
-	// One serialization for the whole plan when possible; otherwise (some part
-	// cannot be serialized) every subtree on its own, so the parts that can
-	// still get keys.
 	vector<string> keys;
 	bool single_pass = !nodes.empty() && SerializeSubtrees(**nodes[0].slot, keys) && keys.size() == nodes.size();
 	for (idx_t i = 0; i < nodes.size(); i++) {
@@ -526,7 +405,6 @@ static void ComputeKeys(PlanAnalysis &analysis) {
 		if (!node.eligible || !node.pure) {
 			continue;
 		}
-		// The root is the whole query: nothing outside it can feed it.
 		if (!node.is_root && node.dependent) {
 			continue;
 		}
@@ -541,35 +419,34 @@ static void ComputeKeys(PlanAnalysis &analysis) {
 	}
 }
 
-//===--------------------------------------------------------------------===//
-// Settings and logging
-//===--------------------------------------------------------------------===//
-
-static bool GetSetting(ClientContext &context, const string &name, Value &result) {
-	return context.TryGetCurrentSetting(name, result) && !result.IsNull();
-}
-
-static bool BoolSetting(ClientContext &context, const string &name, bool fallback) {
+// The current value of a waddle setting, or its registered default if it is unset or NULL.
+static Value GetSetting(ClientContext &context, const string &name) {
 	Value value;
-	return GetSetting(context, name, value) ? value.GetValue<bool>() : fallback;
-}
-
-static idx_t CountSetting(ClientContext &context, const string &name, idx_t fallback) {
-	Value value;
-	if (!GetSetting(context, name, value)) {
-		return fallback;
+	if (context.TryGetCurrentSetting(name, value) && !value.IsNull()) {
+		return value;
 	}
-	auto count = value.GetValue<int64_t>();
+	ExtensionOption option;
+	if (DBConfig::GetConfig(context).TryGetExtensionOption(name, option)) {
+		return option.default_value;
+	}
+	throw InternalException("Unknown waddle setting \"%s\"", name);
+}
+
+static bool BoolSetting(ClientContext &context, const string &name) {
+	return GetSetting(context, name).GetValue<bool>();
+}
+
+static idx_t CountSetting(ClientContext &context, const string &name) {
+	auto count = GetSetting(context, name).GetValue<int64_t>();
 	return count < 0 ? 0 : NumericCast<idx_t>(count);
 }
 
-static double DoubleSetting(ClientContext &context, const string &name, double fallback) {
-	Value value;
-	return GetSetting(context, name, value) ? value.GetValue<double>() : fallback;
+static double DoubleSetting(ClientContext &context, const string &name) {
+	return GetSetting(context, name).GetValue<double>();
 }
 
 static void Log(ClientContext &context, const string &message) {
-	if (BoolSetting(context, "waddle_log", false)) {
+	if (BoolSetting(context, "waddle_log")) {
 		Printer::Print("[waddle] " + message);
 	}
 }
@@ -597,18 +474,10 @@ static bool CanReuse(const shared_ptr<CachedResult> &cached, LogicalOperator &op
 	if (!cached || cached->types != op.types) {
 		return false;
 	}
-	// Rows captured by several threads came out in no particular order.
 	return !node.order_matters || cached->ordered;
 }
 
-//===--------------------------------------------------------------------===//
-// Choosing how to capture
-//===--------------------------------------------------------------------===//
-
-//! Operators that end a pipeline below them and start a new one: whatever is
-//! directly above them runs in exactly one pipeline. (A WINDOW is missing on
-//! purpose: without PARTITION BY or ORDER BY it is planned as a streaming
-//! operator.) Scans and other leaves start a pipeline of their own.
+// Operators that end a pipeline below them and start a new one: whatever is directly above them runs in exactly...
 static bool StartsOnePipeline(LogicalOperatorType type) {
 	switch (type) {
 	case LogicalOperatorType::LOGICAL_ORDER_BY:
@@ -630,10 +499,7 @@ static bool IsRowByRow(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_PROJECTION || type == LogicalOperatorType::LOGICAL_FILTER;
 }
 
-//! A join whose probe side (child 0) streams through it in the same pipeline,
-//! and which emits nothing from a pipeline of its own: an equality (hash)
-//! join of a type that only ever emits rows as probe rows pass. RIGHT, FULL
-//! and the RIGHT_ variants emit unmatched build rows from a second pipeline.
+// A join whose probe side (child 0) streams through it in the same pipeline, and which emits nothing from a...
 static bool StreamsProbeSide(LogicalOperator &op) {
 	if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.children.size() != 2) {
 		return false;
@@ -650,8 +516,6 @@ static bool StreamsProbeSide(LogicalOperator &op) {
 	default:
 		return false;
 	}
-	// Only hash joins for certain: inequality-only joins may be planned as
-	// operators that sink both sides.
 	for (auto &condition : join.conditions) {
 		if (condition.comparison == ExpressionType::COMPARE_EQUAL) {
 			return true;
@@ -660,13 +524,7 @@ static bool StreamsProbeSide(LogicalOperator &op) {
 	return false;
 }
 
-//! True if exactly one pipeline produces this operator's rows: below it,
-//! down the side rows stream through, there are only projections, filters
-//! and hash-join probes, ending at an operator that starts a pipeline. A
-//! UNION, a RIGHT or FULL join, or anything unknown may mean several
-//! pipelines. (A join below may end the pipeline early when its build side
-//! is empty; that is fine, its output is then complete, and the capture
-//! refuses to publish if any thread's rows were not merged.)
+// True if exactly one pipeline produces this operator's rows: below it, down the side rows stream through...
 static bool FlowsFromOnePipeline(LogicalOperator &op) {
 	reference<LogicalOperator> current = op;
 	while (true) {
@@ -681,15 +539,12 @@ static bool FlowsFromOnePipeline(LogicalOperator &op) {
 	}
 }
 
-//! True if whatever consumes this node's rows takes every one of them: above
-//! it there are only projections and filters, up to the end of the query or
-//! to an operator that collects all its input before producing anything.
+// True if whatever consumes this node's rows takes every one of them: above it there are only projections and...
 static bool ConsumedWhole(const vector<PlanNode> &nodes, idx_t index) {
 	idx_t current = index;
 	while (true) {
 		auto parent = nodes[current].parent;
 		if (parent == DConstants::INVALID_INDEX) {
-			// The top of the query: the result collector reads everything.
 			return true;
 		}
 		auto &op = **nodes[parent].slot;
@@ -705,13 +560,9 @@ static bool ConsumedWhole(const vector<PlanNode> &nodes, idx_t index) {
 			return true;
 		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-			// The build side is read completely before any probing starts.
 			if (nodes[current].child_index == 1) {
 				return true;
 			}
-			// The probe side streams on through the join, in the same pipeline:
-			// keep walking up. (Only a join with an empty build side stops it
-			// early, and then the capture refuses to publish.)
 			if (StreamsProbeSide(op)) {
 				current = parent;
 				continue;
@@ -732,9 +583,6 @@ static CaptureMode ChooseCaptureMode(const vector<PlanNode> &nodes, idx_t index)
 	if (!node.order_matters) {
 		return CaptureMode::STREAMING;
 	}
-	// Ordered streaming makes its pipeline single-threaded. At the top of a
-	// query above an ORDER BY or other breaker that pipeline only reads out the
-	// result; anywhere else it could be a whole scan, so materialize instead.
 	if (node.is_root && op.type != LogicalOperatorType::LOGICAL_GET) {
 		reference<LogicalOperator> current = op;
 		while (IsRowByRow(current.get().type) && current.get().children.size() == 1) {
@@ -747,13 +595,7 @@ static CaptureMode ChooseCaptureMode(const vector<PlanNode> &nodes, idx_t index)
 	return CaptureMode::MATERIALIZING;
 }
 
-//! Operators the paper places speculative store operators after: ones
-//! "expected to be computationally expensive and likely to have a small result
-//! size (e.g., the final result of a query, or the result of an aggregation)".
-//! Besides those two examples, a join whose estimated base cost reaches
-//! `expensive_join_cost` (wall ns; 0 = only the paper's examples) qualifies:
-//! the shared work of exploratory workloads is mostly joins that come back
-//! once, which history mode can never catch.
+// Operators the paper places speculative store operators after: ones "expected to be computationally expensive...
 static bool IsSpeculationPoint(const PlanNode &node, double estimated_bcost, double expensive_join_cost) {
 	if (node.is_root) {
 		return true;
@@ -766,16 +608,6 @@ static bool IsSpeculationPoint(const PlanNode &node, double estimated_bcost, dou
 	       estimated_bcost >= expensive_join_cost;
 }
 
-//===--------------------------------------------------------------------===//
-// Measuring base costs (Section III-C, "True Cost and Base Cost")
-//===--------------------------------------------------------------------===//
-
-//! Times each query on one connection, from QueryBegin to QueryEnd. When a
-//! query the cache did not answer ends, its measured time is shared out over
-//! the subtrees it computed in proportion to their estimated cost, and stored
-//! as their base cost: "updated with the current measurement each time the
-//! result is recomputed". (DuckDB's physical plan does not map one to one back
-//! onto these subtrees, so per-operator timings cannot be read off directly.)
 class QueryTimer : public ClientContextState {
 public:
 	QueryTimer(shared_ptr<Recycler> recycler_p, shared_ptr<CostModel> cost_model_p)
@@ -788,14 +620,10 @@ public:
 		armed = false;
 		ClearUnoptimized();
 	}
-
-	//! The unoptimized plan's key, set by the pre-optimize hook; and whether
-	//! that hook already answered the query from the cache.
 	bool unoptimized_valid = false;
 	hash_t unoptimized_fingerprint = 0;
 	string unoptimized_key;
 	bool answered_early = false;
-
 	void ClearUnoptimized() {
 		unoptimized_valid = false;
 		unoptimized_key.clear();
@@ -817,15 +645,12 @@ public:
 		computed.clear();
 	}
 
-	//! Called while planning: `estimated` is the query's own estimated wall
-	//! time (after reuse), `computed_p` the subtrees it computes from base
-	//! tables with their estimated base costs, in the same units.
+	// Called while planning: `estimated` is the query's own estimated wall time (after reuse), `computed_p` the...
 	void Arm(double estimated_p, vector<pair<hash_t, double>> computed_p) {
 		estimated = estimated_p;
 		computed = std::move(computed_p);
 		armed = true;
 	}
-
 private:
 	shared_ptr<Recycler> recycler;
 	shared_ptr<CostModel> cost_model;
@@ -835,10 +660,6 @@ private:
 	double estimated = 0;
 	vector<pair<hash_t, double>> computed;
 };
-
-//===--------------------------------------------------------------------===//
-// Answering repeats before the optimizer runs
-//===--------------------------------------------------------------------===//
 
 static bool PlanIsCacheable(LogicalOperator &op) {
 	if (!OperatorIsCacheable(op)) {
@@ -852,32 +673,23 @@ static bool PlanIsCacheable(LogicalOperator &op) {
 	return true;
 }
 
-//! The pre-optimize hook. Exact repeats are where most of the recycler's
-//! gain is, and a repeat's plan is fully optimized - for a many-way join
-//! that is most of its remaining time - only to be thrown away for a cached
-//! scan. So the unoptimized plan is keyed once; if an earlier query with the
-//! same unoptimized plan (the same query) has its result in the recycler
-//! cache, it is substituted here, before any optimizer runs. The alias from
-//! unoptimized key to graph node is recorded by the post-optimize hook.
+// The pre-optimize hook.
 static void RecycleBeforeOptimizing(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	auto &state = static_cast<RecyclerState &>(*input.info);
 	auto &context = input.context;
-	// Not recycling, but it shapes every plan the recycler sees, so it runs
-	// first: move decorrelated subqueries down to what they depend on.
-	if (BoolSetting(context, "waddle_decorrelate_exists", true)) {
+	if (BoolSetting(context, "waddle_decorrelate_exists")) {
 		state.subqueries_decorrelated += DecorrelateExistsSubqueries(plan);
 	}
-	if (BoolSetting(context, "waddle_push_subqueries", true)) {
+	if (BoolSetting(context, "waddle_push_subqueries")) {
 		state.subqueries_pushed +=
-		    PushDownCorrelatedSubqueries(context, plan, BoolSetting(context, "waddle_push_semi_joins", true));
+		    PushDownCorrelatedSubqueries(context, plan, BoolSetting(context, "waddle_push_semi_joins"));
 	}
-	if (!BoolSetting(context, "waddle_cache", true)) {
+	if (!BoolSetting(context, "waddle_cache")) {
 		return;
 	}
 	auto timer =
 	    context.registered_state->GetOrCreate<QueryTimer>("waddle_query_timer", state.recycler, state.cost_model);
 	timer->ClearUnoptimized();
-
 	reference<unique_ptr<LogicalOperator>> slot = plan;
 	bool executes = true;
 	while (slot.get()->type == LogicalOperatorType::LOGICAL_EXPLAIN && !slot.get()->children.empty()) {
@@ -921,10 +733,6 @@ static void RecycleBeforeOptimizing(OptimizerExtensionInput &input, unique_ptr<L
 	                                rows));
 }
 
-//===--------------------------------------------------------------------===//
-// The rewriter (Section II, "Changes in Query Evaluation")
-//===--------------------------------------------------------------------===//
-
 static void WrapWithStore(PlanNode &node, RecyclerState &state, const StoreDecision &decision) {
 	auto &slot = *node.slot;
 	auto store = make_uniq<LogicalCaptureResult>(state.recycler, decision, node.order_matters, node.mode);
@@ -941,37 +749,29 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	auto &context = input.context;
 	auto &recycler = *state.recycler;
 	auto &cost_model = *state.cost_model;
-
-	if (!BoolSetting(context, "waddle_cache", true)) {
+	if (!BoolSetting(context, "waddle_cache")) {
 		return;
 	}
 	auto timer =
 	    context.registered_state->GetOrCreate<QueryTimer>("waddle_query_timer", state.recycler, state.cost_model);
 	if (timer->answered_early) {
-		// Already a cached scan: nothing left to do.
 		timer->answered_early = false;
 		return;
 	}
-	auto benefit_policies = BoolSetting(context, "waddle_cost_model", true);
-	auto alpha = MinValue(MaxValue(DoubleSetting(context, "waddle_cost_decay", 0.99), 0.0), 1.0);
-	recycler.Configure(CountSetting(context, "waddle_cache_limit_mb", 512) * 1024 * 1024, alpha);
-	auto root_row_limit = CountSetting(context, "waddle_cache_max_rows", 200000);
-	auto subtree_row_limit = CountSetting(context, "waddle_subtree_max_rows", 200000);
-	auto aggregate_row_limit = CountSetting(context, "waddle_aggregate_max_rows", 10000000);
-	auto min_operators = CountSetting(context, "waddle_min_subtree_operators", 1);
-	auto min_work = CountSetting(context, "waddle_min_subtree_work", 0);
-	auto max_subtree_stores = CountSetting(context, "waddle_max_subtree_captures", 3);
-	auto subtrees_enabled = BoolSetting(context, "waddle_subtree_reuse", true);
-	auto expensive_join_cost = DoubleSetting(context, "waddle_speculate_join_us", 2000.0) * 1000.0;
+	auto benefit_policies = BoolSetting(context, "waddle_cost_model");
+	auto alpha = MinValue(MaxValue(DoubleSetting(context, "waddle_cost_decay"), 0.0), 1.0);
+	recycler.Configure(CountSetting(context, "waddle_cache_limit_mb") * 1024 * 1024, alpha);
+	auto root_row_limit = CountSetting(context, "waddle_cache_max_rows");
+	auto subtree_row_limit = CountSetting(context, "waddle_subtree_max_rows");
+	auto aggregate_row_limit = CountSetting(context, "waddle_aggregate_max_rows");
+	auto max_subtree_stores = CountSetting(context, "waddle_max_subtree_captures");
+	auto subtrees_enabled = BoolSetting(context, "waddle_subtree_reuse");
+	auto expensive_join_cost = DoubleSetting(context, "waddle_speculate_join_us") * 1000.0;
 	auto preserve_insertion_order = Settings::Get<PreserveInsertionOrderSetting>(context);
 	CostParameters parameters;
 	parameters.threads =
 	    MaxValue<idx_t>(NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()), 1);
 	auto threads = static_cast<double>(parameters.threads);
-
-	// The grader wraps every query in EXPLAIN ANALYZE, so the query may be the
-	// child of an EXPLAIN node. A plain EXPLAIN only shows the plan: it may
-	// show a cached scan, but must not touch the recycler graph.
 	reference<unique_ptr<LogicalOperator>> slot = plan;
 	bool executes = true;
 	while (slot.get()->type == LogicalOperatorType::LOGICAL_EXPLAIN && !slot.get()->children.empty()) {
@@ -982,28 +782,18 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	}
 	auto &query = *slot.get();
 	idx_t now = ++state.queries_seen;
-
 	if (ChangesState(query)) {
-		// "Evict all cached results dependent on modified tables" [10]; we
-		// evict everything, which is always safe.
 		recycler.Invalidate();
 		Log(context, StringUtil::Format("query %llu changes the database - recycler cache emptied", now));
 		return;
 	}
-
 	plan->ResolveOperatorTypes();
-
 	// Key every subtree we could recycle (see ComputeKeys).
 	PlanAnalysis analysis(context, preserve_insertion_order, parameters);
-	analysis.below_delim = BoolSetting(context, "waddle_recycle_below_delim", false);
 	AnalyzeOperator(slot.get(), true, !subtrees_enabled, RootOrderMatters(query, preserve_insertion_order), analysis);
 	ComputeKeys(analysis);
 	auto &nodes = analysis.nodes;
 	auto correction = cost_model.Correction();
-
-	// 1. Bottom-up rule: match every subtree with the recycler graph, inserting
-	//    the ones without an exact match (Sections III-A, III-B). Preorder
-	//    reversed visits children before their parents.
 	for (idx_t i = nodes.size(); i-- > 0;) {
 		auto &node = nodes[i];
 		if (!node.valid) {
@@ -1016,7 +806,6 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 			}
 		}
 		if (!executes) {
-			// Look, do not touch.
 			node.cached = recycler.Peek(node.fingerprint, node.key);
 			continue;
 		}
@@ -1029,15 +818,10 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		node.existed = match.existed;
 		node.cached = match.cached;
 	}
-
-	// The unoptimized plan of this query leads to this root from now on.
 	auto &root = nodes[0];
 	if (executes && root.valid && timer->unoptimized_valid) {
 		recycler.SetAlias(timer->unoptimized_fingerprint, timer->unoptimized_key, root.fingerprint);
 	}
-
-	// 2. Top-down rule: substitute cached results, largest subtree first. A
-	//    hit replaces the subtree and everything inside it.
 	string reused;
 	if (root.valid && CanReuse(root.cached, query, root)) {
 		auto rows = root.cached->data->Count();
@@ -1069,7 +853,6 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		for (idx_t j = i + 1; j < node.end; j++) {
 			nodes[j].replaced = true;
 		}
-		// Every ancestor now computes less (its true cost, Eq. 2).
 		CostParameters p;
 		auto read_cost = static_cast<double>(rows) * p.cached_scan_row +
 		                 static_cast<double>(node.cached->bytes) * p.cached_scan_byte;
@@ -1086,10 +869,6 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	if (!executes) {
 		return;
 	}
-
-	// 3. Importance factors (Section III-C): every node of this query that
-	//    existed before it and is not below a result the query reused could
-	//    have been used to answer it: h += 1, once per query.
 	std::unordered_map<hash_t, bool> referenced;
 	for (auto &node : nodes) {
 		if (!node.valid || node.replaced || !node.existed || referenced.count(node.fingerprint)) {
@@ -1098,16 +877,12 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		referenced[node.fingerprint] = true;
 		recycler.Reference(node.fingerprint, now);
 	}
-
-	// Estimated base costs (wall ns) for the nodes this query computes, for
-	// nodes not measured yet, and to share the measured time out.
+	// Estimated base costs (wall ns) for the nodes this query computes, for nodes not measured yet, and to share...
 	auto estimated_bcost = [&](const PlanNode &node) {
 		return node.cost / threads * correction;
 	};
 	auto max_bytes = recycler.MaxEntryBytes();
-	//! An aggregation's result is compact and already built in a hash table:
-	//! copying even a large one costs little next to computing it, so it gets
-	//! its own, much higher limit (the per-entry byte limit still applies).
+	// An aggregation's result is compact and already built in a hash table: copying even a large one costs little...
 	auto row_limit = [&](const PlanNode &node) {
 		if (node.is_root) {
 			return root_row_limit;
@@ -1122,12 +897,9 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		if (node.replaced || node.reused || !node.capturable || node.cached) {
 			return false;
 		}
-		return node.is_root || (node.operators >= min_operators && node.work >= min_work);
+		return true;
 	};
-	//! Assesses a candidate. Speculative candidates are by definition never
-	//! seen before: their size is decided at run time, so only results already
-	//! known to be too big are ruled out here. Others are checked against their
-	//! measured size where the graph has one, else the optimizer's estimate.
+	// Assesses a candidate.
 	auto assess = [&](PlanNode &node, bool speculative) {
 		node.mode = ChooseCaptureMode(nodes, static_cast<idx_t>(&node - nodes.data()));
 		node.assessment = recycler.Assess(node.fingerprint, estimated_bcost(node), node.estimated_bytes, speculative,
@@ -1142,7 +914,6 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		auto rows = a.size_measured ? a.measured_rows : node.rows;
 		return rows <= row_limit(node) && a.size <= static_cast<double>(max_bytes);
 	};
-
 	struct Placement {
 		idx_t index;
 		bool speculative;
@@ -1158,18 +929,13 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 		}
 		stores.push_back(Placement {index, speculative});
 	};
-
 	if (benefit_policies) {
-		// 4. History (Section III-C, III-E admission policy): in every subtree
-		//    seen before, the node with the highest benefit B = cost * h / size,
-		//    if the cache can take it.
 		for (idx_t i = 0; i < nodes.size(); i++) {
 			auto &top = nodes[i];
 			if (!top.valid || top.replaced || !top.existed) {
 				continue;
 			}
 			if (top.parent != DConstants::INVALID_INDEX && nodes[top.parent].valid && nodes[top.parent].existed) {
-				// Not the top of a region seen before.
 				continue;
 			}
 			idx_t best = DConstants::INVALID_INDEX;
@@ -1192,30 +958,18 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 			}
 			add_store(best, false);
 		}
-		// 5. Speculation (Section III-D): store operators on new final results
-		//    and aggregations, decided once the result is known (with h=0.001).
 		for (idx_t i = 0; i < nodes.size(); i++) {
 			auto &node = nodes[i];
 			if (!node.valid || node.existed || !IsSpeculationPoint(node, estimated_bcost(node), expensive_join_cost) ||
 			    !eligible(node) || !assess(node, true)) {
 				continue;
 			}
-			// The paper's store operator passes tuples on "without interrupting
-			// the tuple flow" and cancels buffering once the result is not worth
-			// keeping. Only the streaming form can do that: a materializing one
-			// is a pipeline breaker that collects the whole result before it can
-			// decide, and a speculative result's size is unknown. Below the root
-			// - typically on a large join - such a store can cost more than the
-			// query it sits in. The final result itself, the paper's first
-			// example of a small result, may still be materialized.
 			if (node.mode == CaptureMode::MATERIALIZING && !node.is_root) {
 				continue;
 			}
 			add_store(i, true);
 		}
 	} else {
-		// Benefit policies off: keep everything that fits, the whole query and
-		// the most expensive subtrees, admitted by force.
 		vector<idx_t> candidates;
 		for (idx_t i = 1; i < nodes.size(); i++) {
 			if (eligible(nodes[i]) && assess(nodes[i], false)) {
@@ -1235,22 +989,16 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 			add_store(0, false);
 		}
 	}
-
-	// 6. Time the query: its measured time refreshes the base cost of every
-	//    subtree it computes.
 	vector<pair<hash_t, double>> computed;
 	for (auto &node : nodes) {
 		if (node.valid && !node.replaced && !node.reused) {
-			// Base cost from base tables: the estimate before any reuse.
 			computed.emplace_back(node.fingerprint, node.base_cost / threads);
 		}
 	}
 	if (root.valid) {
 		timer->Arm(root.cost / threads, std::move(computed));
 	}
-
-	// 7. Place the store operators. The deepest first: wrapping a node moves
-	//    the contents of its slot, wrapping a descendant moves nothing above.
+	// 7.
 	std::sort(stores.begin(), stores.end(), [](const Placement &a, const Placement &b) { return a.index > b.index; });
 	string placed;
 	for (auto &store : stores) {
@@ -1276,7 +1024,6 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 			state.history_stores++;
 		}
 	}
-
 	auto message = StringUtil::Format("query %llu", now);
 	if (!reused.empty()) {
 		message += " reuses" + reused + ";";
@@ -1292,6 +1039,5 @@ OptimizerExtension CreateRecyclerOptimizer(shared_ptr<RecyclerState> state) {
 	extension.optimizer_info = std::move(state);
 	return extension;
 }
-
-} // namespace duckdb
+}
 

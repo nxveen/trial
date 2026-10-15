@@ -16,12 +16,6 @@ CREATE TABLE c AS SELECT i AS id, i % 100 AS tid, i % 7 AS role FROM range(700) 
 # These queries share one inner subtree (t joined to k, filtered on yr) and do
 # different work above it. The defaults only capture a subtree that cost real
 # work to produce; this data is tiny, so the floor comes down for the test.
-statement ok
-SET waddle_min_subtree_work = 100;
-
-statement ok
-SET waddle_min_subtree_operators = 3;
-
 query II
 SELECT x.kind, count(*) FROM (SELECT k.kind, t.id FROM t JOIN k ON k.id = t.kind_id WHERE t.yr > 2004) x JOIN c ON c.tid = x.id GROUP BY 1 ORDER BY 1;
 ----
@@ -118,6 +112,7 @@ k3	6
 k4	7
 
 statement error
-SET waddle_min_subtree_work = 'lots';
+SET waddle_subtree_max_rows = 'lots';
 ----
 Could not convert
+

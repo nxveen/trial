@@ -1,19 +1,11 @@
 #define DUCKDB_EXTENSION_MAIN
-
 #include "waddle_extension.hpp"
 #include "recycler_optimizer.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-
 namespace duckdb {
-
-//===--------------------------------------------------------------------===//
-// waddle_stats() and waddle_clear()
-//===--------------------------------------------------------------------===//
-
-//! Gives the table functions the same state the optimizer uses.
 struct RecyclerFunctionInfo : public TableFunctionInfo {
 	explicit RecyclerFunctionInfo(shared_ptr<RecyclerState> state) : state(std::move(state)) {
 	}
@@ -32,7 +24,7 @@ static RecyclerState &GetRecyclerState(TableFunctionBindInput &input) {
 	return *input.info->Cast<RecyclerFunctionInfo>().state;
 }
 
-//! The counters are read at bind time, so a query on them does not count itself.
+// The counters are read at bind time, so a query on them does not count itself.
 static unique_ptr<FunctionData> StatsBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	auto &state = GetRecyclerState(input);
@@ -107,11 +99,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("waddle_aggregate_max_rows",
 	                          "Largest aggregation result worth caching, in rows (aggregations are compact)",
 	                          LogicalType::BIGINT, Value::BIGINT(10000000));
-	config.AddExtensionOption("waddle_min_subtree_operators", "Smallest subtree worth caching, in operators",
-	                          LogicalType::BIGINT, Value::BIGINT(1));
-	config.AddExtensionOption("waddle_min_subtree_work",
-	                          "Smallest subtree worth caching, in estimated rows scanned and processed inside it",
-	                          LogicalType::BIGINT, Value::BIGINT(0));
 	config.AddExtensionOption("waddle_max_subtree_captures", "Most store operators on subtrees in one query",
 	                          LogicalType::BIGINT, Value::BIGINT(3));
 	config.AddExtensionOption("waddle_cost_model",
@@ -124,9 +111,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Also store new joins speculatively when their estimated cost reaches this many "
 	                          "microseconds (0: only final results and aggregations, as in the paper's examples)",
 	                          LogicalType::DOUBLE, Value::DOUBLE(2000.0));
-	config.AddExtensionOption("waddle_recycle_below_delim",
-	                          "Also recycle subtrees below delim joins (decorrelated EXISTS / correlated subqueries)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_decorrelate_exists",
 	                          "Turn EXISTS / NOT EXISTS subqueries correlated by one equality into semi / anti joins",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
@@ -138,14 +122,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "the outer query's other joins", LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_log", "Print what the recycler does with each query", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false));
-
 	auto state = make_shared_ptr<RecyclerState>();
 	OptimizerExtension::Register(config, CreateRecyclerOptimizer(state));
-
 	TableFunction stats("waddle_stats", {}, EmitSingleRow, StatsBind, StatsInit);
 	stats.function_info = make_shared_ptr<RecyclerFunctionInfo>(state);
 	loader.RegisterFunction(stats);
-
 	TableFunction clear("waddle_clear", {}, EmitSingleRow, ClearBind, StatsInit);
 	clear.function_info = make_shared_ptr<RecyclerFunctionInfo>(state);
 	loader.RegisterFunction(clear);
@@ -154,9 +135,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 void WaddleExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
+
 std::string WaddleExtension::Name() {
 	return "waddle";
 }
+
 std::string WaddleExtension::Version() const {
 #ifdef EXT_VERSION_WADDLE
 	return EXT_VERSION_WADDLE;
@@ -164,9 +147,7 @@ std::string WaddleExtension::Version() const {
 	return "";
 #endif
 }
-
-} // namespace duckdb
-
+}
 extern "C" {
 DUCKDB_CPP_EXTENSION_ENTRY(waddle, loader) {
 	duckdb::LoadInternal(loader);

@@ -1,17 +1,10 @@
 #include "cache_operators.hpp"
-
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-
 namespace duckdb {
-
-//===--------------------------------------------------------------------===//
-// Scanning a collection, shared by the operators below
-//===--------------------------------------------------------------------===//
-
 class CollectionScanGlobalState : public GlobalSourceState {
 public:
 	CollectionScanGlobalState(shared_ptr<ColumnDataCollection> collection_p, bool ordered)
@@ -23,8 +16,6 @@ public:
 	idx_t MaxThreads() override {
 		return max_threads;
 	}
-
-	//! Held here so the rows outlive anything else that lets go of them.
 	shared_ptr<ColumnDataCollection> collection;
 	ColumnDataParallelScanState scan_state;
 	const idx_t max_threads;
@@ -42,7 +33,7 @@ static SourceResultType ScanCollection(DataChunk &chunk, OperatorSourceInput &in
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 
-//! Hands a complete result to the recycler, which admits it or not.
+// Hands a complete result to the recycler, which admits it or not.
 static void Publish(Recycler &recycler, const StoreDecision &decision, const vector<LogicalType> &types,
                     shared_ptr<ColumnDataCollection> data, bool ordered) {
 	auto result = make_shared_ptr<CachedResult>();
@@ -54,17 +45,10 @@ static void Publish(Recycler &recycler, const StoreDecision &decision, const vec
 	               decision.force, decision.now);
 }
 
-//===--------------------------------------------------------------------===//
-// Materializing store operator
-//===--------------------------------------------------------------------===//
-
 class CaptureGlobalSinkState : public GlobalSinkState {
 public:
 	mutex lock;
-	//! Everything the subtree produced, buffer-managed so it respects
-	//! memory_limit and can spill while the query runs.
 	unique_ptr<ColumnDataCollection> collected;
-	//! What the source half emits, set in Finalize.
 	shared_ptr<ColumnDataCollection> output;
 };
 
@@ -77,17 +61,14 @@ public:
 class PhysicalCaptureResult : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
-
 	PhysicalCaptureResult(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
 	                      shared_ptr<Recycler> recycler, StoreDecision decision, bool ordered)
 	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality),
 	      recycler(std::move(recycler)), decision(decision), ordered(ordered) {
 	}
-
 	shared_ptr<Recycler> recycler;
 	StoreDecision decision;
 	bool ordered;
-
 	string GetName() const override {
 		return "STORE";
 	}
@@ -95,10 +76,11 @@ public:
 	bool IsSink() const override {
 		return true;
 	}
+
 	bool ParallelSink() const override {
-		// One thread keeps rows in the order the subtree produced them.
 		return !ordered;
 	}
+
 	bool SinkOrderDependent() const override {
 		return ordered;
 	}
@@ -130,19 +112,15 @@ public:
 		return SinkCombineResultType::FINISHED;
 	}
 
-	//! Runs once, after every pipeline feeding this operator has finished.
+	// Runs once, after every pipeline feeding this operator has finished.
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override {
 		auto &gstate = input.global_state.Cast<CaptureGlobalSinkState>();
 		if (gstate.collected->SizeInBytes() > decision.max_bytes || gstate.collected->Count() > decision.max_rows) {
-			// Too big to be worth keeping: just pass the rows on.
 			recycler->MarkOversized(decision.fingerprint);
 			gstate.output = std::move(gstate.collected);
 			return SinkFinalizeType::READY;
 		}
-		// The cached copy must not live in the buffer manager: cached results
-		// outlive the query that made them, and DuckDB tears the buffer manager
-		// down before extension state.
 		auto copy = make_shared_ptr<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
 		ColumnDataAppendState append_state;
 		copy->InitializeAppend(append_state);
@@ -162,6 +140,7 @@ public:
 	bool IsSource() const override {
 		return true;
 	}
+
 	bool ParallelSource() const override {
 		return !ordered;
 	}
@@ -175,7 +154,6 @@ public:
 	                                                 GlobalSourceState &gstate) const override {
 		return make_uniq<CollectionScanLocalState>();
 	}
-
 protected:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override {
@@ -183,22 +161,11 @@ protected:
 	}
 };
 
-//===--------------------------------------------------------------------===//
-// Streaming store operator
-//===--------------------------------------------------------------------===//
-
 class StreamingCaptureGlobalState : public GlobalOperatorState {
 public:
 	mutex lock;
-	//! In-memory (not buffer-managed) from the start, so publishing needs no copy.
 	unique_ptr<ColumnDataCollection> collected;
-	//! Set once the rows outgrow what the cache would take: stop copying (the
-	//! paper's "cancels buffering and reverts to passing its input along").
 	atomic<bool> gave_up {false};
-	//! Thread states handed out, and thread states whose rows were merged.
-	//! Publishing requires the two to match: a thread whose share never
-	//! reached FinalExecute (an operator below ended the pipeline on the last
-	//! chunk of a task, say) would otherwise leave a hole in the result.
 	atomic<idx_t> started {0};
 	atomic<idx_t> merged {0};
 };
@@ -212,17 +179,14 @@ public:
 class PhysicalStreamingCapture : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
-
 	PhysicalStreamingCapture(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
 	                         shared_ptr<Recycler> recycler, StoreDecision decision, bool ordered)
 	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality),
 	      recycler(std::move(recycler)), decision(decision), ordered(ordered) {
 	}
-
 	shared_ptr<Recycler> recycler;
 	StoreDecision decision;
 	bool ordered;
-
 	string GetName() const override {
 		return "STORE_STREAMING";
 	}
@@ -230,9 +194,11 @@ public:
 	bool ParallelOperator() const override {
 		return !ordered;
 	}
+
 	bool RequiresFinalExecute() const override {
 		return true;
 	}
+
 	bool RequiresOperatorFinalize() const override {
 		return true;
 	}
@@ -259,9 +225,6 @@ public:
 		auto &lstate = state_p.Cast<StreamingCaptureLocalState>();
 		if (lstate.collected && !gstate.gave_up) {
 			lstate.collected->Append(lstate.append_state, input);
-			// AllocationSize is a running total and an upper bound of the data
-			// size; SizeInBytes walks every block. So the exact size is only
-			// computed once the cheap bound says the limit may be exceeded.
 			auto &collected = *lstate.collected;
 			if (collected.Count() > decision.max_rows ||
 			    (collected.AllocationSize() > decision.max_bytes && collected.SizeInBytes() > decision.max_bytes)) {
@@ -275,7 +238,7 @@ public:
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	//! Runs once per thread, when its share of the pipeline is done.
+	// Runs once per thread, when its share of the pipeline is done.
 	OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk, GlobalOperatorState &gstate_p,
 	                                        OperatorState &state_p) const override {
 		auto &gstate = gstate_p.Cast<StreamingCaptureGlobalState>();
@@ -291,7 +254,7 @@ public:
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
-	//! Runs once, after every thread of the pipeline has finished.
+	// Runs once, after every thread of the pipeline has finished.
 	OperatorFinalResultType OperatorFinalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                                         OperatorFinalizeInput &input) const override {
 		auto &gstate = input.global_state.Cast<StreamingCaptureGlobalState>();
@@ -302,7 +265,6 @@ public:
 			return OperatorFinalResultType::FINISHED;
 		}
 		if (gstate.started == 0 || gstate.merged != gstate.started) {
-			// Some thread's rows are missing: keep nothing rather than half.
 			gstate.collected.reset();
 			return OperatorFinalResultType::FINISHED;
 		}
@@ -322,7 +284,6 @@ void LogicalCaptureResult::ResolveTypes() {
 }
 
 vector<ColumnBinding> LogicalCaptureResult::GetColumnBindings() {
-	// Pass-through: nothing above this operator needs rewriting.
 	return children[0]->GetColumnBindings();
 }
 
@@ -347,25 +308,16 @@ PhysicalOperator &LogicalCaptureResult::CreatePlan(ClientContext &context, Physi
 	return op;
 }
 
-//===--------------------------------------------------------------------===//
-// Cached scan
-//===--------------------------------------------------------------------===//
-
 class PhysicalCachedScan : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
-
 	PhysicalCachedScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
 	                   shared_ptr<CachedResult> result, bool ordered)
 	    : PhysicalOperator(physical_plan, TYPE, std::move(types), estimated_cardinality), result(std::move(result)),
 	      ordered(ordered) {
 	}
-
-	//! Holding the shared_ptr keeps the rows alive for as long as this plan
-	//! exists, even if the recycler evicts the result mid-query.
 	shared_ptr<CachedResult> result;
 	bool ordered;
-
 	string GetName() const override {
 		return "CACHED_SCAN";
 	}
@@ -373,6 +325,7 @@ public:
 	bool IsSource() const override {
 		return true;
 	}
+
 	bool ParallelSource() const override {
 		return !ordered;
 	}
@@ -385,7 +338,6 @@ public:
 	                                                 GlobalSourceState &gstate) const override {
 		return make_uniq<CollectionScanLocalState>();
 	}
-
 protected:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override {
@@ -422,6 +374,5 @@ string LogicalCachedScan::GetExtensionName() const {
 PhysicalOperator &LogicalCachedScan::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	return planner.Make<PhysicalCachedScan>(types, estimated_cardinality, result, ordered);
 }
-
-} // namespace duckdb
+}
 

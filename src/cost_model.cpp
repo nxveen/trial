@@ -1,5 +1,4 @@
 #include "cost_model.hpp"
-
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -9,15 +8,8 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
-
 #include <cmath>
-
 namespace duckdb {
-
-//===--------------------------------------------------------------------===//
-// Estimating a plan
-//===--------------------------------------------------------------------===//
-
 double CostModel::EstimatedRows(LogicalOperator &op) {
 	if (op.type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 		return 0;
@@ -25,7 +17,6 @@ double CostModel::EstimatedRows(LogicalOperator &op) {
 	if (op.has_estimated_cardinality) {
 		return static_cast<double>(op.estimated_cardinality);
 	}
-	// No estimate: assume the operator passes its (largest) input through.
 	double rows = 0;
 	for (auto &child : op.children) {
 		rows = MaxValue(rows, EstimatedRows(*child));
@@ -33,19 +24,23 @@ double CostModel::EstimatedRows(LogicalOperator &op) {
 	return rows;
 }
 
-static double BaseTableRows(ClientContext &context, LogicalGet &get) {
+idx_t CostModel::TableRows(ClientContext &context, LogicalGet &get) {
 	if (!get.function.cardinality) {
-		return CostModel::EstimatedRows(get);
+		return 0;
 	}
 	auto stats = get.function.cardinality(context, get.bind_data.get());
 	if (!stats || !stats->has_estimated_cardinality) {
-		return CostModel::EstimatedRows(get);
+		return 0;
 	}
-	return static_cast<double>(stats->estimated_cardinality);
+	return stats->estimated_cardinality;
 }
 
-//! Number of operations (function calls, comparisons, casts...) an
-//! expression performs per row. Column references and constants are free.
+static double BaseTableRows(ClientContext &context, LogicalGet &get) {
+	auto rows = CostModel::TableRows(context, get);
+	return rows ? static_cast<double>(rows) : CostModel::EstimatedRows(get);
+}
+
+// Number of operations (function calls, comparisons, casts...) an expression performs per row.
 static double ExpressionOperations(const Expression &expression) {
 	double operations = 0;
 	switch (expression.GetExpressionClass()) {
@@ -64,8 +59,7 @@ static double ExpressionOperations(const Expression &expression) {
 	return operations;
 }
 
-//! Operations a filter pushed into a table scan performs per row. Optional
-//! filters only prune row groups, so they cost (almost) nothing per row.
+// Operations a filter pushed into a table scan performs per row.
 static double TableFilterOperations(const TableFilter &filter) {
 	switch (filter.filter_type) {
 	case TableFilterType::EXPRESSION_FILTER:
@@ -82,13 +76,11 @@ static double TableFilterOperations(const TableFilter &filter) {
 	case TableFilterType::DYNAMIC_FILTER:
 		return 0;
 	default:
-		// Comparisons with a constant, IS NULL, IN lists: one operation.
 		return 1;
 	}
 }
 
-//! Per-row cost of hashing rows into `groups` groups: cheap while the hash
-//! table fits in cache, about five times dearer once it does not.
+// Per-row cost of hashing rows into `groups` groups: cheap while the hash table fits in cache, about five times...
 static double GroupedRowCost(double groups, const CostParameters &p) {
 	auto position = (std::log10(MaxValue(groups, 1.0)) - 3.0) / 2.0;
 	position = MinValue(MaxValue(position, 0.0), 1.0);
@@ -106,12 +98,10 @@ double CostModel::OperatorCost(LogicalOperator &op, ClientContext &context, cons
 		input += EstimatedRows(*child);
 	}
 	auto expressions = static_cast<double>(MaxValue<idx_t>(op.expressions.size(), 1));
-	// Work per row in the operator's expressions, counted in operations.
 	double operations = 0;
 	for (auto &expression : op.expressions) {
 		operations += ExpressionOperations(*expression);
 	}
-
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op.Cast<LogicalGet>();
@@ -147,7 +137,6 @@ double CostModel::OperatorCost(LogicalOperator &op, ClientContext &context, cons
 		if (has_equality) {
 			return right * p.hash_build_row + left * p.hash_probe_row + output * p.join_output_row;
 		}
-		// Inequality joins are sort-based (piecewise merge or IEJoin).
 		return SortCost(left, p.sort_row_log) + SortCost(right, p.sort_row_log) + output * p.join_output_row;
 	}
 	case LogicalOperatorType::LOGICAL_ANY_JOIN:
@@ -195,7 +184,6 @@ double CostModel::OperatorCost(LogicalOperator &op, ClientContext &context, cons
 static double TypeBytes(const LogicalType &type) {
 	switch (type.InternalType()) {
 	case PhysicalType::VARCHAR:
-		// The string_t itself, plus a typical short string on the heap.
 		return 32;
 	case PhysicalType::LIST:
 	case PhysicalType::STRUCT:
@@ -209,18 +197,12 @@ static double TypeBytes(const LogicalType &type) {
 double CostModel::RowBytes(const vector<LogicalType> &types) {
 	double bytes = 0;
 	for (auto &type : types) {
-		// Plus one validity bit per value.
 		bytes += TypeBytes(type) + 0.125;
 	}
 	return MaxValue(bytes, 1.0);
 }
 
-//===--------------------------------------------------------------------===//
-// Correction
-//===--------------------------------------------------------------------===//
-
 void CostModel::RecordRatio(double measured, double estimated) {
-	// Only queries big enough to time reliably teach the correction.
 	if (estimated < 200000.0 && measured < 1000000.0) {
 		return;
 	}
@@ -232,8 +214,6 @@ void CostModel::RecordRatio(double measured, double estimated) {
 
 double CostModel::Correction() {
 	lock_guard<mutex> guard(lock);
-	// Pulled towards 1 by two imaginary observations, so the first timings
-	// cannot swing it wildly.
 	auto mean = log_ratio_sum / (log_ratio_count + 2.0);
 	return MinValue(MaxValue(std::exp(mean), 0.25), 64.0);
 }
@@ -243,5 +223,5 @@ void CostModel::Reset() {
 	log_ratio_sum = 0;
 	log_ratio_count = 0;
 }
+}
 
-} // namespace duckdb
