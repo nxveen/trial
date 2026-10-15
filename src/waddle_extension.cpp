@@ -97,23 +97,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("waddle_cache", "Reuse results computed earlier in this session", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_cache_limit_mb", "Memory the result cache may use, in MB", LogicalType::BIGINT,
-	                          Value::BIGINT(1024));
+	                          Value::BIGINT(512));
 	config.AddExtensionOption("waddle_cache_max_rows", "Largest whole-query result worth caching, in rows",
-	                          LogicalType::BIGINT, Value::BIGINT(400000));
+	                          LogicalType::BIGINT, Value::BIGINT(200000));
 	config.AddExtensionOption("waddle_subtree_reuse", "Also cache and reuse subtrees shared between queries",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_subtree_max_rows", "Largest subtree result worth caching, in rows",
-	                          LogicalType::BIGINT, Value::BIGINT(400000));
+	                          LogicalType::BIGINT, Value::BIGINT(200000));
 	config.AddExtensionOption("waddle_aggregate_max_rows",
 	                          "Largest aggregation result worth caching, in rows (aggregations are compact)",
-	                          LogicalType::BIGINT, Value::BIGINT(20000000));
+	                          LogicalType::BIGINT, Value::BIGINT(10000000));
 	config.AddExtensionOption("waddle_min_subtree_operators", "Smallest subtree worth caching, in operators",
 	                          LogicalType::BIGINT, Value::BIGINT(1));
 	config.AddExtensionOption("waddle_min_subtree_work",
 	                          "Smallest subtree worth caching, in estimated rows scanned and processed inside it",
 	                          LogicalType::BIGINT, Value::BIGINT(0));
 	config.AddExtensionOption("waddle_max_subtree_captures", "Most store operators on subtrees in one query",
-	                          LogicalType::BIGINT, Value::BIGINT(4));
+	                          LogicalType::BIGINT, Value::BIGINT(3));
 	config.AddExtensionOption("waddle_cost_model",
 	                          "Use the recycler's benefit-based policies (off: keep everything that fits)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));

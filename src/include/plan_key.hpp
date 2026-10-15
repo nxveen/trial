@@ -30,4 +30,11 @@ bool SerializePlan(const LogicalOperator &op, string &result);
 //! still decide whether a candidate is a match.
 hash_t HashPlanKey(const string &key);
 
+//! The keys SerializePlan would give the plan and each of its subtrees, in
+//! preorder, from a single serialization of the plan - instead of serializing
+//! every subtree on its own, which writes a deep subtree once per ancestor.
+//! Returns false if the plan cannot be serialized as a whole.
+bool SerializeSubtrees(const LogicalOperator &root, vector<string> &keys);
+
 } // namespace duckdb
+

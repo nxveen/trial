@@ -3,6 +3,7 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/hash.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <unordered_map>
 
@@ -52,8 +53,27 @@ public:
 		return out;
 	}
 
+	//! Single-pass mode (see SerializeSubtrees): table indices are written as
+	//! they are and their positions recorded, and the byte range of every
+	//! operator is recorded, in preorder.
+	void RecordSubtrees() {
+		record = true;
+		frames.push_back(Frame {true, nullptr, 0});
+	}
+	struct IndexPosition {
+		idx_t offset;
+		idx_t value;
+	};
+	struct Range {
+		idx_t begin;
+		idx_t end;
+	};
+	vector<IndexPosition> positions;
+	vector<Range> ranges;
+
 protected:
 	void OnPropertyBegin(const field_id_t field_id, const char *tag) override {
+		SetProperty(tag);
 		BeginTag(tag);
 		if (!Skipping()) {
 			Byte('P');
@@ -65,8 +85,10 @@ protected:
 			Byte('p');
 		}
 		EndTag();
+		SetProperty(nullptr);
 	}
 	void OnOptionalPropertyBegin(const field_id_t field_id, const char *tag, bool present) override {
+		SetProperty(tag);
 		BeginTag(tag);
 		if (!Skipping()) {
 			Byte('O');
@@ -79,11 +101,30 @@ protected:
 			Byte('o');
 		}
 		EndTag();
+		SetProperty(nullptr);
 	}
 	void OnObjectBegin() override {
 		Marker('{');
+		if (record) {
+			// An operator's children are serialized as the elements of its
+			// "children" property; expressions have one too, but only the
+			// children of an operator are operators.
+			auto &parent = frames.back();
+			bool is_operator = parent.is_operator && parent.property && strcmp(parent.property, "children") == 0;
+			frames.push_back(Frame {is_operator, nullptr, 0});
+			if (is_operator) {
+				frames.back().range = ranges.size();
+				ranges.push_back(Range {out.size(), 0});
+			}
+		}
 	}
 	void OnObjectEnd() override {
+		if (record) {
+			if (frames.back().is_operator) {
+				ranges[frames.back().range].end = out.size();
+			}
+			frames.pop_back();
+		}
 		Marker('}');
 	}
 	void OnListBegin(idx_t count) override {
@@ -134,7 +175,14 @@ protected:
 	}
 	void WriteValue(uint64_t value) override {
 		if (!tags.empty() && IsTableIndexTag(tags.back())) {
-			value = Canonical(value);
+			if (record) {
+				// Renumbered per subtree afterwards; remember where it is.
+				if (!Skipping()) {
+					positions.push_back(IndexPosition {out.size() + 1, value});
+				}
+			} else {
+				value = Canonical(value);
+			}
 		}
 		Scalar('L', value);
 	}
@@ -218,6 +266,19 @@ private:
 		}
 	}
 
+	struct Frame {
+		bool is_operator;
+		const char *property;
+		idx_t range;
+	};
+	void SetProperty(const char *tag) {
+		if (record) {
+			frames.back().property = tag;
+		}
+	}
+
+	bool record = false;
+	vector<Frame> frames;
 	string out;
 	vector<const char *> tags;
 	//! Depth of the tag stack at which an ignored field began; 0 when none.
@@ -240,8 +301,49 @@ bool SerializePlan(const LogicalOperator &op, string &result) {
 	}
 }
 
+bool SerializeSubtrees(const LogicalOperator &root, vector<string> &keys) {
+	try {
+		CanonicalPlanSerializer serializer;
+		serializer.RecordSubtrees();
+		root.Serialize(serializer);
+		auto &out = serializer.Result();
+		// The root's range is the whole output; the others were recorded in
+		// preorder as their objects began.
+		vector<CanonicalPlanSerializer::Range> ranges;
+		ranges.push_back(CanonicalPlanSerializer::Range {0, out.size()});
+		ranges.insert(ranges.end(), serializer.ranges.begin(), serializer.ranges.end());
+		auto &positions = serializer.positions;
+		keys.clear();
+		keys.reserve(ranges.size());
+		for (auto &range : ranges) {
+			// A subtree's bytes are exactly what serializing it alone writes,
+			// except that its table indices must be numbered from its own root:
+			// renumber them in order of first appearance within the range.
+			string key = out.substr(range.begin, range.end - range.begin);
+			std::unordered_map<idx_t, idx_t> local;
+			auto first = std::lower_bound(positions.begin(), positions.end(), range.begin,
+			                              [](const CanonicalPlanSerializer::IndexPosition &position, idx_t offset) {
+				                              return position.offset < offset;
+			                              });
+			for (auto position = first; position != positions.end() && position->offset < range.end; ++position) {
+				auto entry = local.find(position->value);
+				idx_t number = entry != local.end() ? entry->second : local.size();
+				if (entry == local.end()) {
+					local[position->value] = number;
+				}
+				memcpy(&key[position->offset - range.begin], &number, sizeof(number));
+			}
+			keys.push_back(std::move(key));
+		}
+		return true;
+	} catch (std::exception &) {
+		return false;
+	}
+}
+
 hash_t HashPlanKey(const string &key) {
 	return Hash(key.c_str(), key.size());
 }
 
 } // namespace duckdb
+

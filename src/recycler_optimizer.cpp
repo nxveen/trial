@@ -120,7 +120,8 @@ static bool DependsOnSurroundingPlan(LogicalOperatorType type) {
 //!
 //! LIMIT without an ordering picks an arbitrary set of rows, so the answer
 //! depends on the order its input arrives in. Replacing part of that input with
-//! cached rows could change which rows are picked.
+//! cached rows could change which rows are picked. (A LIMIT directly over a
+//! sort is the exception: see LimitOverSort.)
 //! A recursive CTE runs its body repeatedly against the working table, so a
 //! piece of the body is not one result.
 //! A delim join (how DuckDB decorrelates EXISTS and other correlated
@@ -379,6 +380,23 @@ static void FindDynamicFilters(const TableFilter &filter, idx_t node, vector<Dyn
 	}
 }
 
+//! True if `op` is a LIMIT whose input is a sort (through projections only).
+//! Such a LIMIT picks rows by the sort order, which does not depend on the
+//! order its input arrives in - unlike a LIMIT over unordered rows - so it
+//! need not block recycling below it. (A paged or re-sorted variant of a query
+//! can then reuse everything up to, and even including, the sort.)
+static bool LimitOverSort(LogicalOperator &op) {
+	if (op.type != LogicalOperatorType::LOGICAL_LIMIT || op.children.size() != 1) {
+		return false;
+	}
+	reference<LogicalOperator> current = *op.children[0];
+	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION && current.get().children.size() == 1) {
+		current = *current.get().children[0];
+	}
+	return current.get().type == LogicalOperatorType::LOGICAL_ORDER_BY ||
+	       current.get().type == LogicalOperatorType::LOGICAL_TOP_N;
+}
+
 static void AnalyzeOperator(unique_ptr<LogicalOperator> &slot, bool is_root, bool blocked, bool order_matters,
                             PlanAnalysis &analysis, idx_t parent = DConstants::INVALID_INDEX, idx_t child_index = 0) {
 	auto &op = *slot;
@@ -427,7 +445,7 @@ static void AnalyzeOperator(unique_ptr<LogicalOperator> &slot, bool is_root, boo
 		break;
 	}
 
-	auto blocked_below = blocked || BlocksDescent(op.type, analysis.below_delim);
+	auto blocked_below = blocked || (BlocksDescent(op.type, analysis.below_delim) && !LimitOverSort(op));
 	for (idx_t i = 0; i < op.children.size(); i++) {
 		auto child_index = analysis.nodes.size();
 		auto child_order = ChildOrderMatters(op, i, order_matters, analysis.preserve_insertion_order);
@@ -498,6 +516,11 @@ static bool DynamicFiltersStayInside(const PlanAnalysis &analysis, idx_t begin, 
 //! the extra rows change nothing above.
 static void ComputeKeys(PlanAnalysis &analysis) {
 	auto &nodes = analysis.nodes;
+	// One serialization for the whole plan when possible; otherwise (some part
+	// cannot be serialized) every subtree on its own, so the parts that can
+	// still get keys.
+	vector<string> keys;
+	bool single_pass = !nodes.empty() && SerializeSubtrees(**nodes[0].slot, keys) && keys.size() == nodes.size();
 	for (idx_t i = 0; i < nodes.size(); i++) {
 		auto &node = nodes[i];
 		if (!node.eligible || !node.pure) {
@@ -507,7 +530,9 @@ static void ComputeKeys(PlanAnalysis &analysis) {
 		if (!node.is_root && node.dependent) {
 			continue;
 		}
-		if (!SerializePlan(**node.slot, node.key)) {
+		if (single_pass) {
+			node.key = std::move(keys[i]);
+		} else if (!SerializePlan(**node.slot, node.key)) {
 			continue;
 		}
 		node.fingerprint = HashPlanKey(node.key);
@@ -935,7 +960,7 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	auto aggregate_row_limit = CountSetting(context, "waddle_aggregate_max_rows", 10000000);
 	auto min_operators = CountSetting(context, "waddle_min_subtree_operators", 1);
 	auto min_work = CountSetting(context, "waddle_min_subtree_work", 0);
-	auto max_subtree_stores = CountSetting(context, "waddle_max_subtree_captures", 4);
+	auto max_subtree_stores = CountSetting(context, "waddle_max_subtree_captures", 3);
 	auto subtrees_enabled = BoolSetting(context, "waddle_subtree_reuse", true);
 	auto expensive_join_cost = DoubleSetting(context, "waddle_speculate_join_us", 2000.0) * 1000.0;
 	auto preserve_insertion_order = Settings::Get<PreserveInsertionOrderSetting>(context);
