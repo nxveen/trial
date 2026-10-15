@@ -286,9 +286,45 @@ void Recycler::Invalidate() {
 	bytes_used = 0;
 }
 
+void Recycler::RegisterRangeVariant(hash_t signature, const string &key, hash_t node,
+                                    const vector<Value> &constants) {
+	lock_guard<mutex> guard(lock);
+	auto &group = range_index[signature];
+	if (group.key.empty()) {
+		group.key = key;
+	} else if (group.key != key) {
+		return;
+	}
+	for (auto &variant : group.variants) {
+		if (variant.node == node) {
+			return;
+		}
+	}
+	group.variants.push_back(RangeVariant {node, constants});
+}
+
+vector<pair<shared_ptr<CachedResult>, vector<Value>>> Recycler::CachedRangeVariants(hash_t signature,
+                                                                                   const string &key) {
+	lock_guard<mutex> guard(lock);
+	vector<pair<shared_ptr<CachedResult>, vector<Value>>> found;
+	auto entry = range_index.find(signature);
+	if (entry == range_index.end() || entry->second.key != key) {
+		return found;
+	}
+	auto &variants = entry->second.variants;
+	for (idx_t i = variants.size(); i-- > 0;) {
+		auto node = Find(variants[i].node);
+		if (node && node->cached) {
+			found.emplace_back(node->cached, variants[i].constants);
+		}
+	}
+	return found;
+}
+
 void Recycler::Reset() {
 	lock_guard<mutex> guard(lock);
 	graph.clear();
+	range_index.clear();
 	aliases.clear();
 	bytes_used = 0;
 	latest = 0;

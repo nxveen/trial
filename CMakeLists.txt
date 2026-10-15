@@ -20,6 +20,7 @@ set(EXTENSION_SOURCES
     src/cost_model.cpp
     src/recycler.cpp
     src/subquery_pushdown.cpp
+    src/subsumption.cpp
     src/cache_operators.cpp
     src/recycler_optimizer.cpp)
 

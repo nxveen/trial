@@ -17,6 +17,7 @@ struct RecyclerState : public OptimizerExtensionInfo {
 	atomic<idx_t> not_admitted {0};
 	atomic<idx_t> subqueries_pushed {0};
 	atomic<idx_t> subqueries_decorrelated {0};
+	atomic<idx_t> subsumption_hits {0};
 	// Empties the cache, forgets the recycler graph and zeroes every counter.
 	void Reset() {
 		recycler->Reset();
@@ -31,6 +32,7 @@ struct RecyclerState : public OptimizerExtensionInfo {
 		not_admitted = 0;
 		subqueries_pushed = 0;
 		subqueries_decorrelated = 0;
+		subsumption_hits = 0;
 	}
 };
 

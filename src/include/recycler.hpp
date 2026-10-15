@@ -80,6 +80,10 @@ public:
 	// Forgets everything, the graph included.
 	void Reset();
 	idx_t MaxEntryBytes();
+	// Remembers that the subtree `node` has this range signature and these filter constants.
+	void RegisterRangeVariant(hash_t signature, const string &key, hash_t node, const vector<Value> &constants);
+	// The cached subtrees with this range signature, most recent first, with their filter constants.
+	vector<pair<shared_ptr<CachedResult>, vector<Value>>> CachedRangeVariants(hash_t signature, const string &key);
 	RecyclerStats GetStats();
 private:
 	// All private helpers expect `lock` to be held.
@@ -102,6 +106,15 @@ private:
 	};
 	mutex lock;
 	std::unordered_map<hash_t, GraphNode> graph;
+	struct RangeVariant {
+		hash_t node;
+		vector<Value> constants;
+	};
+	struct RangeGroup {
+		string key;
+		vector<RangeVariant> variants;
+	};
+	std::unordered_map<hash_t, RangeGroup> range_index;
 	std::unordered_map<hash_t, Alias> aliases;
 	idx_t budget = 512ULL * 1024 * 1024;
 	double alpha = 0.99;

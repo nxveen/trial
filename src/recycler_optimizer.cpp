@@ -1,4 +1,6 @@
 #include "recycler_optimizer.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/config.hpp"
 #include "cache_operators.hpp"
 #include "cost_model.hpp"
@@ -6,6 +8,7 @@
 #include "plan_key.hpp"
 #include "plan_rewrite.hpp"
 #include "subquery_pushdown.hpp"
+#include "subsumption.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -136,7 +139,9 @@ static bool OperatorIsCacheable(LogicalOperator &op) {
 		return false;
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		if (!op.Cast<LogicalGet>().GetTable()) {
+		auto table = op.Cast<LogicalGet>().GetTable();
+		// A temporary table belongs to one connection, but keys name it like any other.
+		if (!table || table->temporary || table->ParentCatalog().IsTemporaryCatalog()) {
 			return false;
 		}
 	}
@@ -621,11 +626,19 @@ public:
 		ClearUnoptimized();
 	}
 	bool unoptimized_valid = false;
+	bool text_valid = false;
+	hash_t text_fingerprint = 0;
+	string text_key;
+	bool signature_valid = false;
+	RangeSignature signature;
 	hash_t unoptimized_fingerprint = 0;
 	string unoptimized_key;
 	bool answered_early = false;
 	void ClearUnoptimized() {
 		unoptimized_valid = false;
+		text_valid = false;
+		text_key.clear();
+		signature_valid = false;
 		unoptimized_key.clear();
 		answered_early = false;
 	}
@@ -674,9 +687,59 @@ static bool PlanIsCacheable(LogicalOperator &op) {
 }
 
 // The pre-optimize hook.
+// Replaces the query with `cached` if its types and row order fit; true if it did.
+static bool AnswerEarly(OptimizerExtensionInput &input, RecyclerState &state, QueryTimer &timer,
+                        unique_ptr<LogicalOperator> &slot, shared_ptr<CachedResult> cached, hash_t root, bool executes) {
+	auto &context = input.context;
+	auto &query = *slot;
+	query.ResolveOperatorTypes();
+	auto order_matters = RootOrderMatters(query, Settings::Get<PreserveInsertionOrderSetting>(context));
+	if (cached->types != query.types || (order_matters && !cached->ordered)) {
+		return false;
+	}
+	auto rows = cached->data->Count();
+	idx_t now = ++state.queries_seen;
+	if (executes) {
+		state.recycler->Reference(root, now);
+	}
+	slot = make_uniq<LogicalCachedScan>(std::move(cached), input.optimizer.binder.GenerateTableIndex(), order_matters);
+	timer.answered_early = true;
+	state.whole_query_hits++;
+	Log(context, StringUtil::Format("query %llu answered from the recycler cache before optimizing (%llu rows)", now,
+	                                rows));
+	return true;
+}
+
 static void RecycleBeforeOptimizing(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	auto &state = static_cast<RecyclerState &>(*input.info);
 	auto &context = input.context;
+	shared_ptr<QueryTimer> timer;
+	reference<unique_ptr<LogicalOperator>> slot = plan;
+	bool executes = true;
+	bool cacheable = false;
+	if (BoolSetting(context, "waddle_cache")) {
+		timer = context.registered_state->GetOrCreate<QueryTimer>("waddle_query_timer", state.recycler,
+		                                                          state.cost_model);
+		timer->ClearUnoptimized();
+		while (slot.get()->type == LogicalOperatorType::LOGICAL_EXPLAIN && !slot.get()->children.empty()) {
+			if (slot.get()->Cast<LogicalExplain>().explain_type != ExplainType::EXPLAIN_ANALYZE) {
+				executes = false;
+			}
+			slot = slot.get()->children[0];
+		}
+		cacheable = !ChangesState(*slot.get()) && PlanIsCacheable(*slot.get());
+		auto &text = context.GetCurrentQuery();
+		if (cacheable && !text.empty()) {
+			timer->text_key = "sql " + to_string(context.GetConnectionId()) + "\n" + text;
+			timer->text_fingerprint = HashPlanKey(timer->text_key);
+			timer->text_valid = true;
+			hash_t root = 0;
+			auto cached = state.recycler->LookupAlias(timer->text_fingerprint, timer->text_key, root);
+			if (cached && AnswerEarly(input, state, *timer, slot.get(), std::move(cached), root, executes)) {
+				return;
+			}
+		}
+	}
 	if (BoolSetting(context, "waddle_decorrelate_exists")) {
 		state.subqueries_decorrelated += DecorrelateExistsSubqueries(plan);
 	}
@@ -684,24 +747,10 @@ static void RecycleBeforeOptimizing(OptimizerExtensionInput &input, unique_ptr<L
 		state.subqueries_pushed +=
 		    PushDownCorrelatedSubqueries(context, plan, BoolSetting(context, "waddle_push_semi_joins"));
 	}
-	if (!BoolSetting(context, "waddle_cache")) {
+	if (!cacheable) {
 		return;
-	}
-	auto timer =
-	    context.registered_state->GetOrCreate<QueryTimer>("waddle_query_timer", state.recycler, state.cost_model);
-	timer->ClearUnoptimized();
-	reference<unique_ptr<LogicalOperator>> slot = plan;
-	bool executes = true;
-	while (slot.get()->type == LogicalOperatorType::LOGICAL_EXPLAIN && !slot.get()->children.empty()) {
-		if (slot.get()->Cast<LogicalExplain>().explain_type != ExplainType::EXPLAIN_ANALYZE) {
-			executes = false;
-		}
-		slot = slot.get()->children[0];
 	}
 	auto &query = *slot.get();
-	if (ChangesState(query) || !PlanIsCacheable(query)) {
-		return;
-	}
 	string key;
 	if (!SerializePlan(query, key)) {
 		return;
@@ -713,24 +762,25 @@ static void RecycleBeforeOptimizing(OptimizerExtensionInput &input, unique_ptr<L
 	timer->unoptimized_fingerprint = fingerprint;
 	timer->unoptimized_key = std::move(key);
 	if (!cached) {
+		if (BoolSetting(context, "waddle_subsumption") && ComputeRangeSignature(query, timer->signature)) {
+			timer->signature_valid = true;
+			auto order_matters = RootOrderMatters(query, Settings::Get<PreserveInsertionOrderSetting>(context));
+			auto &signature = timer->signature;
+			for (auto &variant : state.recycler->CachedRangeVariants(signature.fingerprint, signature.key)) {
+				if (TryRangeSubsumption(input.optimizer.binder, slot.get(), signature, variant.second, variant.first,
+				                        order_matters)) {
+					timer->answered_early = true;
+					state.subsumption_hits++;
+					Log(context, "a query was answered by filtering a cached result with a wider range");
+					return;
+				}
+			}
+		}
 		return;
 	}
-	query.ResolveOperatorTypes();
-	auto order_matters = RootOrderMatters(query, Settings::Get<PreserveInsertionOrderSetting>(context));
-	if (cached->types != query.types || (order_matters && !cached->ordered)) {
-		return;
+	if (AnswerEarly(input, state, *timer, slot.get(), std::move(cached), root, executes) && timer->text_valid) {
+		state.recycler->SetAlias(timer->text_fingerprint, timer->text_key, root);
 	}
-	auto rows = cached->data->Count();
-	idx_t now = ++state.queries_seen;
-	if (executes) {
-		state.recycler->Reference(root, now);
-	}
-	slot.get() = make_uniq<LogicalCachedScan>(std::move(cached), input.optimizer.binder.GenerateTableIndex(),
-	                                           order_matters);
-	timer->answered_early = true;
-	state.whole_query_hits++;
-	Log(context, StringUtil::Format("query %llu answered from the recycler cache before optimizing (%llu rows)", now,
-	                                rows));
 }
 
 static void WrapWithStore(PlanNode &node, RecyclerState &state, const StoreDecision &decision) {
@@ -821,6 +871,13 @@ static void RecycleResults(OptimizerExtensionInput &input, unique_ptr<LogicalOpe
 	auto &root = nodes[0];
 	if (executes && root.valid && timer->unoptimized_valid) {
 		recycler.SetAlias(timer->unoptimized_fingerprint, timer->unoptimized_key, root.fingerprint);
+		if (timer->text_valid) {
+			recycler.SetAlias(timer->text_fingerprint, timer->text_key, root.fingerprint);
+		}
+		if (timer->signature_valid) {
+			recycler.RegisterRangeVariant(timer->signature.fingerprint, timer->signature.key, root.fingerprint,
+			                              timer->signature.constants);
+		}
 	}
 	string reused;
 	if (root.valid && CanReuse(root.cached, query, root)) {

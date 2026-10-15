@@ -45,6 +45,7 @@ static unique_ptr<FunctionData> StatsBind(ClientContext &context, TableFunctionB
 	add("not_admitted", state.not_admitted.load());
 	add("subqueries_pushed", state.subqueries_pushed.load());
 	add("subqueries_decorrelated", state.subqueries_decorrelated.load());
+	add("subsumption_hits", state.subsumption_hits.load());
 	add("admissions", recycler.admissions);
 	add("replacements_rejected", recycler.replacements_rejected);
 	add("evictions", recycler.evictions);
@@ -120,6 +121,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("waddle_push_subqueries",
 	                          "Evaluate correlated EXISTS / IN subqueries on the tables they depend on, before "
 	                          "the outer query's other joins", LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("waddle_subsumption", "Answer a query by filtering a cached result with a wider range",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_log", "Print what the recycler does with each query", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false));
 	auto state = make_shared_ptr<RecyclerState>();
