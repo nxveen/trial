@@ -100,7 +100,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Largest aggregation result worth caching, in rows (aggregations are compact)",
 	                          LogicalType::BIGINT, Value::BIGINT(10000000));
 	config.AddExtensionOption("waddle_max_subtree_captures", "Most store operators on subtrees in one query",
-	                          LogicalType::BIGINT, Value::BIGINT(3));
+	                          LogicalType::BIGINT, Value::BIGINT(4));
 	config.AddExtensionOption("waddle_cost_model",
 	                          "Use the recycler's benefit-based policies (off: keep everything that fits)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
