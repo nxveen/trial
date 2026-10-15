@@ -97,16 +97,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("waddle_cache", "Reuse results computed earlier in this session", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_cache_limit_mb", "Memory the result cache may use, in MB", LogicalType::BIGINT,
-	                          Value::BIGINT(512));
+	                          Value::BIGINT(1024));
 	config.AddExtensionOption("waddle_cache_max_rows", "Largest whole-query result worth caching, in rows",
-	                          LogicalType::BIGINT, Value::BIGINT(200000));
+	                          LogicalType::BIGINT, Value::BIGINT(400000));
 	config.AddExtensionOption("waddle_subtree_reuse", "Also cache and reuse subtrees shared between queries",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_subtree_max_rows", "Largest subtree result worth caching, in rows",
-	                          LogicalType::BIGINT, Value::BIGINT(200000));
+	                          LogicalType::BIGINT, Value::BIGINT(400000));
 	config.AddExtensionOption("waddle_aggregate_max_rows",
 	                          "Largest aggregation result worth caching, in rows (aggregations are compact)",
-	                          LogicalType::BIGINT, Value::BIGINT(10000000));
+	                          LogicalType::BIGINT, Value::BIGINT(20000000));
 	config.AddExtensionOption("waddle_min_subtree_operators", "Smallest subtree worth caching, in operators",
 	                          LogicalType::BIGINT, Value::BIGINT(1));
 	config.AddExtensionOption("waddle_min_subtree_work",
@@ -126,7 +126,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::DOUBLE, Value::DOUBLE(2000.0));
 	config.AddExtensionOption("waddle_recycle_below_delim",
 	                          "Also recycle subtrees below delim joins (decorrelated EXISTS / correlated subqueries)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("waddle_decorrelate_exists",
 	                          "Turn EXISTS / NOT EXISTS subqueries correlated by one equality into semi / anti joins",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));

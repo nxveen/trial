@@ -185,7 +185,7 @@ private:
 	mutex lock;
 	std::unordered_map<hash_t, GraphNode> graph;
 	std::unordered_map<hash_t, Alias> aliases;
-	idx_t budget = 512ULL * 1024 * 1024;
+	idx_t budget = 1024ULL * 1024 * 1024;
 	double alpha = 0.99;
 	idx_t bytes_used = 0;
 	idx_t latest = 0;
